@@ -52,10 +52,13 @@ wss.on("connection", (ws) => {
   console.log("✅ Twilio WebSocket connected");
 
   let streamSid = null;
+
+  // collection state
   let collecting = false;
   let buffers = [];
   let collectTimer = null;
   let greetingDone = false;
+  let collectAttempts = 0;
 
   ws.on("message", async (msg) => {
     let data;
@@ -70,7 +73,7 @@ wss.on("connection", (ws) => {
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
-        // Greeting (Mode A tone if no key, Mode B OpenAI TTS if key)
+        // Play greeting
         const greeting = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
         if (!process.env.OPENAI_API_KEY) {
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
@@ -85,15 +88,8 @@ wss.on("connection", (ws) => {
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
 
-        // Wait for greeting mark before collecting (avoids overlap)
-        const waitForGreetingThenCollect = async () => {
-          const deadline = Date.now() + 2500; // up to ~2.5s
-          while (!greetingDone && Date.now() < deadline) {
-            await new Promise(r => setTimeout(r, 50));
-          }
-          startCollecting();
-        };
-        waitForGreetingThenCollect();
+        // IMPORTANT: do NOT start collecting yet; wait for greeting mark
+        stopCollecting(); // ensure clean slate
         break;
 
       case "media":
@@ -103,10 +99,11 @@ wss.on("connection", (ws) => {
         break;
 
       case "mark":
-        // Twilio echoes marks after it finishes playing our audio
         console.log("📍 Twilio mark:", data?.mark?.name);
-        if (data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") {
+        if ((data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") && !greetingDone) {
           greetingDone = true;
+          // Start a fresh 4s collection NOW that the greeting finished
+          startCollectingWindow(4000);
         }
         break;
 
@@ -117,24 +114,33 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => console.log("❌ WebSocket closed"));
+  ws.on("close", () => {
+    stopCollecting();
+    console.log("❌ WebSocket closed");
+  });
+
   ws.on("error", (err) => {
     console.error("⚠️ WebSocket error:", err?.message || err);
     try { ws.close(); } catch {}
   });
 
-  function startCollecting() {
+  function startCollectingWindow(ms) {
+    stopCollecting(); // reset any previous window
     collecting = true;
     buffers = [];
-    if (collectTimer) clearTimeout(collectTimer);
+    collectAttempts += 1;
 
-    // Collect ~4s of caller speech, then process one-turn
     collectTimer = setTimeout(async () => {
       collecting = false;
       const mulaw = Buffer.concat(buffers);
       buffers = [];
 
-      if (!mulaw.length) return;
+      // If near-empty or likely silence, one retry with a longer window
+      const isLikelySilence = mulaw.length < 160 * 10; // < ~200ms of audio
+      if (isLikelySilence && collectAttempts < 2) {
+        console.log("🤫 Low audio captured — extending collection window");
+        return startCollectingWindow(5000);
+      }
 
       try {
         const wav16k = await convertMulaw8kToWav16k(mulaw);
@@ -149,10 +155,23 @@ wss.on("connection", (ws) => {
           voice: process.env.TTS_VOICE || "alloy",
           model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
         });
+
+        // (Optional) queue another collection window for a second turn
+        collectAttempts = 0;
+        startCollectingWindow(5000);
       } catch (e) {
         console.error("❌ ASR/Reply error:", e?.message || e);
       }
-    }, 4000);
+    }, ms);
+  }
+
+  function stopCollecting() {
+    collecting = false;
+    buffers = [];
+    if (collectTimer) {
+      clearTimeout(collectTimer);
+      collectTimer = null;
+    }
   }
 });
 
