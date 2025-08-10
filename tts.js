@@ -1,51 +1,52 @@
-// tts.js — playback helpers using ffmpeg-static (no system ffmpeg required)
+// tts.js — playback helpers using ffmpeg-static and Twilio's streamSid
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 const fetch = require("node-fetch");
 
-// Twilio expects 20ms μ-law@8k frames, base64 payload, over the same WS.
-// Each frame = 160 bytes at 8k μ-law (20ms).
-const FRAME_BYTES = 160;
+const FRAME_BYTES = 160; // 20ms @ 8k μ-law
 
-// Send a "media" JSON message with base64 audio payload
-function sendMediaFrame(ws, chunk) {
+function sendMediaFrame(ws, streamSid, chunk) {
   if (!ws || ws.readyState !== ws.OPEN) return;
-  const payload = chunk.toString("base64");
-  ws.send(
-    JSON.stringify({
-      event: "media",
-      media: { payload }
-    })
-  );
+  ws.send(JSON.stringify({
+    event: "media",
+    streamSid, // REQUIRED by Twilio for outbound media
+    media: { payload: chunk.toString("base64") },
+  }));
 }
 
-// Chunk a Buffer into 160-byte frames and send each as a media event
-function streamMuLawBuffer(ws, mulawBuffer) {
+function sendMark(ws, streamSid, name) {
+  if (!ws || ws.readyState !== ws.OPEN) return;
+  ws.send(JSON.stringify({
+    event: "mark",
+    streamSid,
+    mark: { name },
+  }));
+}
+
+function streamMuLawBuffer(ws, streamSid, mulawBuffer) {
   for (let i = 0; i < mulawBuffer.length; i += FRAME_BYTES) {
     const frame = mulawBuffer.subarray(i, Math.min(i + FRAME_BYTES, mulawBuffer.length));
     if (frame.length < FRAME_BYTES) {
-      // pad last frame with silence if needed
-      const padded = Buffer.alloc(FRAME_BYTES, 0x7f); // μ-law silence
+      // pad last frame with μ-law silence (0x7F)
+      const padded = Buffer.alloc(FRAME_BYTES, 0x7f);
       frame.copy(padded);
-      sendMediaFrame(ws, padded);
+      sendMediaFrame(ws, streamSid, padded);
     } else {
-      sendMediaFrame(ws, frame);
+      sendMediaFrame(ws, streamSid, frame);
     }
   }
 }
 
-// Mode A: Generate a quick confirmation tone (sine wave) -> μ-law@8k and stream it
-async function startPlaybackTone({ ws, seconds = 2, freq = 880, logPrefix = "TONE" }) {
+// Mode A: generate a short tone via ffmpeg and stream it to Twilio
+async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPrefix = "TONE" }) {
   return new Promise((resolve, reject) => {
-    // Generate tone with ffmpeg and output μ-law@8k
-    //  -re (not used) since we're offline-chunking; we just push frames quickly.
     const args = [
       "-f", "lavfi",
       "-i", `sine=frequency=${freq}:duration=${seconds}`,
       "-ar", "8000",
       "-ac", "1",
       "-f", "mulaw",
-      "pipe:1"
+      "pipe:1",
     ];
 
     const p = spawn(ffmpegPath, args);
@@ -53,13 +54,14 @@ async function startPlaybackTone({ ws, seconds = 2, freq = 880, logPrefix = "TON
 
     p.stdout.on("data", (buf) => {
       total += buf.length;
-      streamMuLawBuffer(ws, buf);
+      streamMuLawBuffer(ws, streamSid, buf);
     });
 
-    p.stderr.on("data", () => {}); // keep quiet unless debugging
+    p.stderr.on("data", () => {}); // quiet unless debugging
 
     p.on("close", (code) => {
       if (code === 0) {
+        sendMark(ws, streamSid, `${logPrefix}-done`);
         console.log(`${logPrefix}: sent ~${total} bytes μ-law`);
         resolve();
       } else {
@@ -71,8 +73,8 @@ async function startPlaybackTone({ ws, seconds = 2, freq = 880, logPrefix = "TON
   });
 }
 
-// Mode B: Use OpenAI TTS -> transcode to μ-law@8k with ffmpeg-static -> stream to Twilio
-async function startPlaybackFromTTS({ ws, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
+// Mode B: use OpenAI TTS -> transcode to μ-law@8k -> stream to Twilio
+async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is required for TTS mode");
   }
@@ -82,14 +84,14 @@ async function startPlaybackFromTTS({ ws, text, voice = "alloy", model = "gpt-4o
     method: "POST",
     headers: {
       "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       model,
       voice,
       input: text,
-      format: "mp3"
-    })
+      format: "mp3",
+    }),
   });
 
   if (!resp.ok) {
@@ -99,18 +101,17 @@ async function startPlaybackFromTTS({ ws, text, voice = "alloy", model = "gpt-4o
 
   const mp3Buffer = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Pipe MP3 into ffmpeg-static to convert → μ-law@8k
+  // 2) Transcode MP3 -> μ-law@8k and stream frames to Twilio
   return new Promise((resolve, reject) => {
     const args = [
-      "-i", "pipe:0",     // read MP3 from stdin
+      "-i", "pipe:0",
       "-ar", "8000",
       "-ac", "1",
       "-f", "mulaw",
-      "pipe:1"            // write μ-law to stdout
+      "pipe:1",
     ];
 
     const p = spawn(ffmpegPath, args);
-
     p.stdin.write(mp3Buffer);
     p.stdin.end();
 
@@ -118,13 +119,14 @@ async function startPlaybackFromTTS({ ws, text, voice = "alloy", model = "gpt-4o
 
     p.stdout.on("data", (buf) => {
       total += buf.length;
-      streamMuLawBuffer(ws, buf);
+      streamMuLawBuffer(ws, streamSid, buf);
     });
 
     p.stderr.on("data", () => {}); // quiet unless needed
 
     p.on("close", (code) => {
       if (code === 0) {
+        sendMark(ws, streamSid, "tts-done");
         console.log(`TTS: sent ~${total} bytes μ-law`);
         resolve();
       } else {
@@ -138,5 +140,5 @@ async function startPlaybackFromTTS({ ws, text, voice = "alloy", model = "gpt-4o
 
 module.exports = {
   startPlaybackTone,
-  startPlaybackFromTTS
+  startPlaybackFromTTS,
 };
