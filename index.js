@@ -1,88 +1,57 @@
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
-require("dotenv").config();
+// index.js
+import express from 'express';
+import http from 'http';
+import WebSocket from 'ws';
+import bodyParser from 'body-parser';
+import dotenv from 'dotenv';
+dotenv.config();
 
-const { handleIncomingAudio } = require("./stream-handler");
-const { ttsToPCM } = require("./tts");
+import { handleStream } from './stream-handler.js';
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 3000;
+// ✅ Health check endpoint for Fly.io
+app.get('/health', (req, res) => res.send('ok'));
 
-// Simple GET check
-app.get("/", (req, res) => {
-  res.status(200).send("DPA backend (low latency) is live ✅");
-});
+// ✅ Twilio webhook to start streaming
+app.post('/twilio/voice', (req, res) => {
+  console.log('📞 Incoming Twilio Voice webhook hit');
 
-// Twilio webhook → start streaming
-app.post("/twilio/voice", (req, res) => {
+  const host = req.headers.host;
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
+        <Stream url="wss://${host}/media-stream" track="inbound_track" />
       </Start>
       <Pause length="30" />
     </Response>
   `;
-  res.type("text/xml");
+
+  res.type('text/xml');
   res.send(twiml.trim());
 });
 
-// HTTP server
+// ✅ Create HTTP server
 const server = http.createServer(app);
 
-// WebSocket server
+// ✅ WebSocket server (noServer mode for manual upgrade)
 const wss = new WebSocket.Server({ noServer: true });
-let lastAIResponse = ""; // 🛑 Prevent spirals
 
-wss.on("connection", (ws) => {
-  console.log("✅ WebSocket connection established");
-
-  ws.on("message", async (message) => {
-    try {
-      const msg = JSON.parse(message);
-
-      if (msg.event === "media") {
-        await handleIncomingAudio(msg.media.payload, async (aiText) => {
-          // Skip duplicate responses
-          if (aiText && aiText !== lastAIResponse) {
-            lastAIResponse = aiText;
-            console.log(`🧠 AI says: ${aiText}`);
-
-            const audioPCM = await ttsToPCM(aiText);
-            ws.send(
-              JSON.stringify({
-                event: "media",
-                media: {
-                  payload: audioPCM.toString("base64"),
-                },
-              })
-            );
-          }
-        });
-      }
-    } catch (err) {
-      console.error("⚠️ WS message error:", err);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("❌ WebSocket connection closed");
-  });
-});
-
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/media-stream") {
+server.on('upgrade', (req, socket, head) => {
+  if (req.url === '/media-stream') {
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
+      console.log('✅ WebSocket connection established with Twilio');
+      handleStream(ws);
     });
   } else {
     socket.destroy();
   }
 });
 
+// ✅ Start server
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
