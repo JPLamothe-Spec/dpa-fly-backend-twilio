@@ -1,70 +1,157 @@
+// index.js — Twilio <Stream> -> inline ffmpeg (mulaw@8k -> pcm_s16le@16k), no transcoder.js
+
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
+const bodyParser = require("body-parser");
+const { spawn } = require("child_process");
+const ffmpegPath = require("ffmpeg-static"); // install: npm i ffmpeg-static
 require("dotenv").config();
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Health check endpoint for Fly.io
-app.get("/", (req, res) => {
-  res.status(200).send("Twilio backend live");
-});
+const app = express();
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
-// Simple GET endpoint to test if webhook URL is live (optional)
-app.get("/twilio/voice", (req, res) => {
-  res.status(200).send("Twilio voice webhook endpoint is live.");
-});
+// --- Health checks
+app.get("/", (_req, res) => res.status(200).send("DPA backend (Twilio inline ffmpeg) is live ✅"));
+app.get("/twilio/voice", (_req, res) => res.status(200).send("Twilio voice webhook endpoint is live."));
 
-// Twilio webhook to answer calls and start Media Stream with 16kHz PCM
+// --- Twilio webhook: answer and start Media Stream
 app.post("/twilio/voice", (req, res) => {
+  // Keep the call open with a Pause so the stream can flow
+  const host = req.headers.host;
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
+        <Stream url="wss://${host}/media-stream" track="inbound_track" />
       </Start>
+      <Pause length="30"/>
     </Response>
   `.trim();
 
-  res.type("text/xml");
-  res.send(twiml);
+  res.set("Content-Type", "text/xml");
+  res.set("Content-Length", Buffer.byteLength(twiml, "utf8").toString());
+  res.status(200).send(twiml);
 });
 
-// Create HTTP server and WebSocket server
+// --- HTTP server + WS (manual upgrade so path is flexible on Fly)
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
-// Handle WebSocket upgrades for media streaming
+// Utility: start one ffmpeg process per call to upsample μ-law 8k -> PCM s16le 16k
+function startInlineFfmpeg() {
+  // ffmpeg -f mulaw -ar 8000 -ac 1 -i pipe:0 -f s16le -ar 16000 -ac 1 pipe:1
+  const ff = spawn(ffmpegPath, [
+    "-f", "mulaw",
+    "-ar", "8000",
+    "-ac", "1",
+    "-i", "pipe:0",
+    "-f", "s16le",
+    "-ar", "16000",
+    "-ac", "1",
+    "pipe:1"
+  ], { stdio: ["pipe", "pipe", "inherit"] });
+
+  ff.on("error", (e) => console.error("❌ ffmpeg error:", e));
+  ff.on("close", (code, signal) => {
+    console.log(`🧹 ffmpeg closed (code=${code} signal=${signal})`);
+  });
+
+  return ff;
+}
+
+// Placeholder: wire your 16k PCM to GPT or another engine here
+function onPcm16000(buffer) {
+  // TODO: stream buffer to your AI engine
+  // For now we’ll just log the size occasionally
+  console.log(`🎧 PCM16k chunk: ${buffer.length} bytes`);
+}
+
 server.on("upgrade", (request, socket, head) => {
-  if (request.url === "/media-stream") {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
-    });
-  } else {
+  if (request.url !== "/media-stream") {
     socket.destroy();
+    return;
   }
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit("connection", ws, request);
+  });
 });
 
-// Handle incoming WebSocket connections and raw 16kHz PCM audio
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   console.log("✅ WebSocket connection established");
 
-  ws.on("message", (message) => {
-    // Raw 16kHz PCM audio chunks arrive here
-    console.log(`📨 Received audio chunk: ${message.length} bytes`);
+  // ffmpeg pipeline for this call
+  const ff = startInlineFfmpeg();
 
-    // TODO: Add your AI transcription or processing logic here
+  // Pump transcoded PCM16k to handler
+  ff.stdout.on("data", (chunk) => onPcm16000(chunk));
+
+  ws.on("message", (msg) => {
+    // Twilio sends JSON frames (connected, start, media, mark, stop)
+    let data;
+    try {
+      data = JSON.parse(msg.toString("utf8"));
+    } catch (e) {
+      console.error("⚠️ Non-JSON WS frame:", e);
+      return;
+    }
+
+    switch (data.event) {
+      case "connected":
+        console.log("📞 Twilio media stream connected");
+        break;
+
+      case "start":
+        console.log(`🔗 Stream started. streamSid=${data.start?.streamSid || "unknown"}`);
+        break;
+
+      case "media": {
+        // Base64 μ-law @8kHz audio
+        const b64 = data.media?.payload;
+        if (!b64) return;
+        const mulaw = Buffer.from(b64, "base64");
+        // Write μ-law bytes to ffmpeg stdin; it will output PCM16k on stdout
+        const ok = ff.stdin.write(mulaw);
+        if (!ok) {
+          // Backpressure (rare with these sizes) — pause WS a tick
+          ws.pause?.();
+          ff.stdin.once("drain", () => ws.resume?.());
+        }
+        break;
+      }
+
+      case "mark":
+        // optional: handle your own progress markers
+        break;
+
+      case "stop":
+        console.log("🛑 Twilio signaled stop — closing stream");
+        try { ff.stdin.end(); } catch {}
+        ws.close();
+        break;
+
+      default:
+        // ignore
+        break;
+    }
   });
 
   ws.on("close", () => {
     console.log("❌ WebSocket connection closed");
+    try { ff.stdin.end(); } catch {}
   });
 
   ws.on("error", (err) => {
     console.error("⚠️ WebSocket error:", err);
+    try { ff.stdin.end(); } catch {}
+    try { ws.close(); } catch {}
   });
 });
 
+// Start server
 server.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
