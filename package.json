@@ -1,6 +1,6 @@
 {
   "name": "dpa-fly-backend-twilio",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "private": true,
   "type": "commonjs",
   "main": "index.js",
@@ -16,4 +16,3 @@
     "ws": "^8.17.1"
   }
 }
-
