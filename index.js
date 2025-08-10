@@ -1,9 +1,8 @@
-// index.js — Twilio <Connect><Stream> full duplex baseline (Debian + ffmpeg-static)
+// index.js — Twilio <Connect><Stream> full duplex (passes streamSid to playback)
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const bodyParser = require("body-parser");
-const fetch = require("node-fetch");
 require("dotenv").config();
 
 const { startPlaybackFromTTS, startPlaybackTone } = require("./tts");
@@ -14,7 +13,7 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// --- 1) Twilio webhook: return full-duplex stream ---
+// Twilio webhook: open a full-duplex media stream
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers.host;
   const twiml = `
@@ -29,13 +28,13 @@ app.post("/twilio/voice", (req, res) => {
   res.send(twiml);
 });
 
-// Helpful pings
+// Simple health checks
 app.get("/", (_req, res) => res.status(200).send("DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const server = http.createServer(app);
 
-// --- 2) WebSocket: Twilio connects here for media duplex ---
+// WebSocket endpoint Twilio connects to
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (request, socket, head) => {
@@ -52,64 +51,62 @@ wss.on("connection", (ws) => {
   console.log("✅ Twilio WebSocket connected");
 
   let streamSid = null;
-  let started = false;
-  let closed = false;
 
   ws.on("message", async (msg) => {
+    let data;
     try {
-      const data = JSON.parse(msg.toString());
+      data = JSON.parse(msg.toString());
+    } catch (e) {
+      console.error("⚠️ WS message parse error:", e);
+      return;
+    }
 
-      if (data.event === "connected") {
+    switch (data.event) {
+      case "connected":
         console.log("📞 Twilio media stream connected");
-      }
+        break;
 
-      if (data.event === "start") {
+      case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
-        started = true;
 
-        // === PLAYBACK: pick one mode ===
-        // Mode A: simple tone (no API keys required) — proves outbound audio
+        // Choose playback mode
         if (!process.env.OPENAI_API_KEY) {
-          startPlaybackTone({ ws, logPrefix: "TONE" })
+          console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
+          startPlaybackTone({ ws, streamSid, logPrefix: "TONE" })
             .catch((e) => console.error("TTS/playback error (tone):", e?.message || e));
         } else {
-          // Mode B: OpenAI TTS speaking Anna's greeting
+          console.log("🔊 Playback mode: OpenAI TTS");
           const greet = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
           startPlaybackFromTTS({
             ws,
+            streamSid,
             text: greet,
-            voice: process.env.TTS_VOICE || "alloy",        // set if you want a specific voice
-            model: process.env.TTS_MODEL || "gpt-4o-mini-tts" // OpenAI TTS model
+            voice: process.env.TTS_VOICE || "alloy",
+            model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
-      }
+        break;
 
-      if (data.event === "media") {
-        // Inbound 20ms μ-law@8k frames from caller — you can forward to ASR/LLM here
-        // data.media.payload is base64 μ-law. Logging each chunk is noisy; keep minimal.
-        // console.log("🔊 inbound media", data.media?.payload?.length || 0);
-      }
+      case "media":
+        // inbound μ-law@8k frames in data.media.payload (base64)
+        // keep logs minimal to avoid noise
+        break;
 
-      if (data.event === "mark") {
-        // Optional: used to coordinate transfers
-        // console.log("📍 mark", data.mark?.name);
-      }
+      case "mark":
+        // Twilio will echo back your marks when it finishes playing your audio
+        // console.log("📍 mark from Twilio:", data?.mark?.name);
+        break;
 
-      if (data.event === "stop") {
+      case "stop":
         console.log("🛑 Twilio signaled stop — closing stream");
         try { ws.close(); } catch {}
-      }
-    } catch (e) {
-      console.error("⚠️ WS message parse error:", e);
+        break;
     }
   });
 
   ws.on("close", () => {
-    if (!closed) {
-      closed = true;
-      console.log("❌ WebSocket closed");
-    }
+    console.log("❌ WebSocket closed");
   });
 
   ws.on("error", (err) => {
@@ -118,7 +115,6 @@ wss.on("connection", (ws) => {
   });
 });
 
-// --- 3) Start server ---
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
 });
