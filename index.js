@@ -1,4 +1,4 @@
-// index.js — Full duplex + 1-turn ASR (Whisper) -> GPT -> TTS reply
+// index.js — Full duplex + 1-turn ASR (Whisper) -> GPT -> TTS reply, with FAST cached greeting
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -8,16 +8,26 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3)
+// Native-friendly fetch shim (node-fetch v3 in CJS)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-const { startPlaybackFromTTS, startPlaybackTone } = require("./tts");
+const {
+  startPlaybackFromTTS,
+  startPlaybackTone,
+  warmGreeting,
+  playCachedGreeting,
+} = require("./tts");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
+const GREETING_TEXT =
+  process.env.GREETING_TEXT ||
+  "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
+const TTS_VOICE = process.env.TTS_VOICE || "alloy";
+const TTS_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
 // --- Twilio webhook: open full-duplex media stream
 app.post("/twilio/voice", (req, res) => {
@@ -73,22 +83,23 @@ wss.on("connection", (ws) => {
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
-        // Play greeting
-        const greeting = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
         if (!process.env.OPENAI_API_KEY) {
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
           startPlaybackTone({ ws, streamSid, logPrefix: "TONE" })
             .catch((e) => console.error("TTS/playback error (tone):", e?.message || e));
         } else {
-          console.log("🔊 Playback mode: OpenAI TTS");
-          startPlaybackFromTTS({
-            ws, streamSid, text: greeting,
-            voice: process.env.TTS_VOICE || "alloy",
-            model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
+          console.log("🔊 Playback mode: OpenAI TTS (cached)");
+          // Play cached greeting immediately; fallback to live TTS if not warmed yet
+          playCachedGreeting({
+            ws,
+            streamSid,
+            text: GREETING_TEXT,
+            voice: TTS_VOICE,
+            model: TTS_MODEL,
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
 
-        // IMPORTANT: do NOT start collecting yet; wait for greeting mark
+        // IMPORTANT: wait for greeting mark before starting the 1st collect window
         stopCollecting(); // ensure clean slate
         break;
 
@@ -152,8 +163,8 @@ wss.on("connection", (ws) => {
 
         await startPlaybackFromTTS({
           ws, streamSid, text: reply,
-          voice: process.env.TTS_VOICE || "alloy",
-          model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
+          voice: TTS_VOICE,
+          model: TTS_MODEL,
         });
 
         // (Optional) queue another collection window for a second turn
@@ -239,6 +250,12 @@ async function generateReply(userText) {
   return json.choices?.[0]?.message?.content?.trim() || "Okay.";
 }
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
+  // Warm the greeting cache at boot so greeting plays immediately on first call
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      await warmGreeting({ text: GREETING_TEXT, voice: TTS_VOICE, model: TTS_MODEL });
+    } catch {}
+  }
 });
