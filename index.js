@@ -133,21 +133,8 @@ Keep replies short, warm, and proactive. Extract intent and suggested next actio
 // ---------- Inbound audio pipeline (μ-law→PCM16k) ----------
 function startMulaw8kToPcm16k() {
   const ff = spawn(ffmpegPath, [
-    "-f",
-    "mulaw",
-    "-ar",
-    "8000",
-    "-ac",
-    "1",
-    "-i",
-    "pipe:0",
-    "-f",
-    "s16le",
-    "-ar",
-    "16000",
-    "-ac",
-    "1",
-    "pipe:1",
+    "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0",
+    "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
   ], { stdio: ["pipe", "pipe", "inherit"] });
   ff.on("error", (e) => console.error("❌ ffmpeg (inbound) error:", e));
   ff.on("close", (c, s) => console.log(`🧹 ffmpeg inbound closed (code=${c} signal=${s})`));
@@ -200,12 +187,8 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg.toString("utf8"));
-    } catch (e) {
-      console.error("⚠️ Non-JSON WS frame:", e);
-      return;
-    }
+    try { data = JSON.parse(msg.toString("utf8")); }
+    catch (e) { console.error("⚠️ Non-JSON WS frame:", e); return; }
 
     switch (data.event) {
       case "connected":
