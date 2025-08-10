@@ -1,4 +1,4 @@
-// index.js — Full duplex + optional 1-turn ASR (Whisper) -> GPT -> TTS reply
+// index.js — Full duplex + 1-turn ASR (Whisper) -> GPT -> TTS reply
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -85,8 +85,15 @@ wss.on("connection", (ws) => {
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
 
-        // Start a simple 1-turn collect → transcribe → reply cycle
-        startCollecting();
+        // Wait for greeting mark before collecting (avoids overlap)
+        const waitForGreetingThenCollect = async () => {
+          const deadline = Date.now() + 2500; // up to ~2.5s
+          while (!greetingDone && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 50));
+          }
+          startCollecting();
+        };
+        waitForGreetingThenCollect();
         break;
 
       case "media":
@@ -96,6 +103,7 @@ wss.on("connection", (ws) => {
         break;
 
       case "mark":
+        // Twilio echoes marks after it finishes playing our audio
         console.log("📍 Twilio mark:", data?.mark?.name);
         if (data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") {
           greetingDone = true;
@@ -135,12 +143,6 @@ wss.on("connection", (ws) => {
 
         const reply = await generateReply(transcript);
         console.log("🤖 GPT reply:", reply);
-
-        // Wait briefly for greeting mark before sending reply
-        const waitUntil = Date.now() + 2000; // up to ~2s
-        while (!greetingDone && Date.now() < waitUntil) {
-          await new Promise(r => setTimeout(r, 50));
-        }
 
         await startPlaybackFromTTS({
           ws, streamSid, text: reply,
