@@ -6,7 +6,12 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Simple GET endpoint to test if webhook URL is live
+// Health check endpoint for Fly.io
+app.get("/", (req, res) => {
+  res.status(200).send("Twilio backend live");
+});
+
+// Simple GET endpoint to test if webhook URL is live (optional)
 app.get("/twilio/voice", (req, res) => {
   res.status(200).send("Twilio voice webhook endpoint is live.");
 });
