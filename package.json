@@ -1,17 +1,11 @@
 {
   "name": "dpa-fly-backend-twilio",
-  "private": true,
+  "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "express": "^4.19.2",
-    "ws": "^8.17.1",
-    "twilio": "^5.3.4",
-    "node-fetch": "^3.3.2",
-    "pino": "^9.3.2",
-    "pino-pretty": "^11.2.2",
-    "uuid": "^9.0.1"
+    "ws": "^8.18.0"
   }
 }
