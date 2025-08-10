@@ -21,11 +21,12 @@ const PORT = process.env.PORT || 3000;
 
 // --- Twilio webhook: open full-duplex media stream
 app.post("/twilio/voice", (req, res) => {
+  console.log("➡️ /twilio/voice hit");
   const host = req.headers.host;
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="wss://${host}/media-stream" track="both_tracks"/>
+        <Stream url="wss://${host}/media-stream"/>
       </Connect>
     </Response>
   `.trim();
@@ -95,7 +96,6 @@ wss.on("connection", (ws) => {
         break;
 
       case "mark":
-        // Twilio echoes marks after it finishes playing our audio
         console.log("📍 Twilio mark:", data?.mark?.name);
         if (data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") {
           greetingDone = true;
@@ -136,7 +136,7 @@ wss.on("connection", (ws) => {
         const reply = await generateReply(transcript);
         console.log("🤖 GPT reply:", reply);
 
-        // If greeting hasn't completed, wait briefly for mark; otherwise, continue.
+        // Wait briefly for greeting mark before sending reply
         const waitUntil = Date.now() + 2000; // up to ~2s
         while (!greetingDone && Date.now() < waitUntil) {
           await new Promise(r => setTimeout(r, 50));
