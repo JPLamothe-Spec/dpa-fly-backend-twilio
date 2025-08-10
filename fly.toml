@@ -1,0 +1,32 @@
+app = "dpa-fly-backend-twilio"
+
+[build]
+  image = "node:18-bullseye"
+
+[env]
+  PORT = "3000"
+
+[experimental]
+  auto_rollback = true
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[services]]
+  internal_port = 3000
+  protocol = "tcp"
+
+  [[services.ports]]
+    port = 80
+
+  [[services.ports]]
+    port = 443
+
+  [[services.http_checks]]
+    method = "get"
+    path = "/"
+    protocol = "http"
