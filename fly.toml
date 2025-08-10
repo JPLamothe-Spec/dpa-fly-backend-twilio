@@ -1,11 +1,16 @@
+app = "dpa-fly-backend-twilio"
+primary_region = "syd"
+
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = false
   auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
 
-  [[http_service.checks]]
+  [http_service.checks]
     interval = "5s"
-    timeout  = "2s"
-    method   = "GET"
-    path     = "/health"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "get"
+    path = "/health"
