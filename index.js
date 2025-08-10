@@ -68,7 +68,7 @@ wss.on("connection", (ws) => {
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
-        // Greet (Mode A tone if no key, Mode B OpenAI TTS if key)
+        // Greeting (Mode A tone if no key, Mode B OpenAI TTS if key)
         const greeting = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
         if (!process.env.OPENAI_API_KEY) {
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
@@ -95,7 +95,7 @@ wss.on("connection", (ws) => {
 
       case "mark":
         // Twilio echoes marks after it finishes playing our audio
-        // console.log("📍 Twilio mark:", data?.mark?.name);
+        console.log("📍 Twilio mark:", data?.mark?.name);
         break;
 
       case "stop":
@@ -160,7 +160,9 @@ function convertMulaw8kToWav16k(mulawBuffer) {
     const p = spawn(ffmpegPath, args);
     const chunks = [];
     p.stdout.on("data", (b) => chunks.push(b));
-    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`)));
+    p.on("close", (code) =>
+      code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`))
+    );
     p.on("error", reject);
     p.stdin.end(mulawBuffer);
   });
