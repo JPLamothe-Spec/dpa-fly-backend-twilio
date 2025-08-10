@@ -1,33 +1,36 @@
-// tts.js — paced outbound with track:"outbound"
+// tts.js — paced outbound μ-law using ffmpeg-static; Twilio infers track from TwiML
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
+require("dotenv").config();
+
+// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-const FRAME_BYTES = 160;      // 20ms @ 8k μ-law
+const FRAME_BYTES = 160;   // 20ms @ 8k μ-law
 const FRAME_MS = 20;
 
+// Send a single frame
 function sendMediaFrame(ws, streamSid, chunk) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({
     event: "media",
     streamSid,
-    track: "outbound",                          // <-- add track
     media: { payload: chunk.toString("base64") }
   }));
 }
 
+// Send a mark (Twilio will echo it back)
 function sendMark(ws, streamSid, name) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({
     event: "mark",
     streamSid,
-    track: "outbound",                          // <-- add track
     mark: { name }
   }));
 }
 
-// Pace frames at ~20ms so Twilio plays them reliably
-function paceAndSendMuLaw(ws, streamSid, mulawBuffer) {
+// Build 20ms frames and pace them; append a short μ-law silence tail to ensure clean end
+function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true } = {}) {
   return new Promise((resolve) => {
     const frames = [];
     for (let i = 0; i < mulawBuffer.length; i += FRAME_BYTES) {
@@ -38,6 +41,14 @@ function paceAndSendMuLaw(ws, streamSid, mulawBuffer) {
         frames.push(padded);
       } else {
         frames.push(frame);
+      }
+    }
+
+    if (addSilenceTail) {
+      // ~200ms of silence to help Twilio finalize playback
+      const tailFrames = Math.ceil(200 / FRAME_MS);
+      for (let i = 0; i < tailFrames; i++) {
+        frames.push(Buffer.alloc(FRAME_BYTES, 0x7f));
       }
     }
 
@@ -56,14 +67,22 @@ function paceAndSendMuLaw(ws, streamSid, mulawBuffer) {
   });
 }
 
-// Tone playback (collect -> pace -> send)
+// Mode A: simple tone to prove outbound audio path
 async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPrefix = "TONE" }) {
   return new Promise((resolve, reject) => {
-    const args = ["-f","lavfi","-i",`sine=frequency=${freq}:duration=${seconds}`,
-                  "-ar","8000","-ac","1","-f","mulaw","pipe:1"];
+    const args = [
+      "-f", "lavfi",
+      "-i", `sine=frequency=${freq}:duration=${seconds}`,
+      "-ar", "8000",
+      "-ac", "1",
+      "-f", "mulaw",
+      "pipe:1",
+    ];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
-    p.stdout.on("data", (buf) => chunks.push(buf));
+    p.stdout.on("data", (buf) => { chunks.push(buf); });
+    p.stderr.on("data", () => {});
+
     p.on("close", async (code) => {
       if (code !== 0) return reject(new Error(`${logPrefix} ffmpeg exited with code ${code}`));
       const out = Buffer.concat(chunks);
@@ -76,10 +95,11 @@ async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPr
   });
 }
 
-// OpenAI TTS playback (collect -> pace -> send)
+// Mode B: OpenAI TTS -> μ-law@8k -> stream to Twilio
 async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for TTS mode");
 
+  // 1) Fetch TTS audio (MP3) from OpenAI
   const resp = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -89,14 +109,16 @@ async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", mode
     body: JSON.stringify({ model, voice, input: text, format: "mp3" }),
   });
   if (!resp.ok) throw new Error(`OpenAI TTS failed: ${resp.status} ${await resp.text().catch(() => "")}`);
-
   const mp3Buffer = Buffer.from(await resp.arrayBuffer());
 
+  // 2) Transcode MP3 -> μ-law@8k and stream frames
   return new Promise((resolve, reject) => {
     const args = ["-i","pipe:0","-ar","8000","-ac","1","-f","mulaw","pipe:1"];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
-    p.stdout.on("data", (buf) => chunks.push(buf));
+    p.stdout.on("data", (buf) => { chunks.push(buf); });
+    p.stderr.on("data", () => {});
+
     p.on("close", async (code) => {
       if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
       const out = Buffer.concat(chunks);
