@@ -1,5 +1,6 @@
 // index.js — Twilio <Stream> -> inline ffmpeg (mulaw@8k -> pcm_s16le@16k)
-// + Live transcription (Whisper) + DPA brain (GPT-4o-mini). No transcoder.js needed.
+// + Live transcription (Whisper) + DPA brain (GPT-4o-mini)
+// + End-of-call summary (optional email via SendGrid)
 
 const express = require("express");
 const http = require("http");
@@ -8,13 +9,14 @@ const bodyParser = require("body-parser");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static");         // npm i ffmpeg-static
 const OpenAI = require("openai");                    // npm i openai
-const { toFile } = require("openai/uploads");        // helper to send Buffer as a file
+const { toFile } = require("openai/uploads");
+const sgMail = (() => { try { return require("@sendgrid/mail"); } catch { return null; } })(); // npm i @sendgrid/mail
 require("dotenv").config();
 
 const PORT = process.env.PORT || 3000;
 const app = express();
 
-// --- noisy request logging to help live-debug
+// 🔊 request logging
 app.use((req, _res, next) => {
   console.log(`➡️  ${req.method} ${req.originalUrl} Host:${req.headers.host}`);
   next();
@@ -23,11 +25,11 @@ app.use((req, _res, next) => {
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// --- Health checks
+// Health checks
 app.get("/", (_req, res) => res.status(200).send("DPA backend (Twilio inline ffmpeg) is live ✅"));
 app.get("/twilio/voice", (_req, res) => res.status(200).send("Twilio voice webhook endpoint is live."));
 
-// --- Twilio webhook: answer and start Media Stream
+// Twilio webhook: answer and start Media Stream
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers.host;
   const twiml = `
@@ -44,24 +46,20 @@ app.post("/twilio/voice", (req, res) => {
   res.status(200).send(twiml);
 });
 
-// --- HTTP server + WS (manual upgrade so path is flexible on Fly)
+// HTTP + WS (manual upgrade)
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
-
 server.on("upgrade", (request, socket, head) => {
-  if (request.url !== "/media-stream") {
-    socket.destroy();
-    return;
-  }
+  if (request.url !== "/media-stream") return socket.destroy();
   wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
 });
 
-// ---------- AI bits (Whisper + GPT-4o-mini) ----------
+// ---------- OpenAI clients ----------
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// tiny wav header helper for 16k mono s16le (PCM) buffers
+// WAV header for 16k mono s16le
 function pcmToWav16kMono(pcmBuffer) {
-  const byteRate = 16000 * 2; // 16k * 16-bit mono bytes/sec
+  const byteRate = 16000 * 2; // 16k * 16-bit mono
   const blockAlign = 2;
   const dataSize = pcmBuffer.length;
   const header = Buffer.alloc(44);
@@ -69,13 +67,13 @@ function pcmToWav16kMono(pcmBuffer) {
   header.writeUInt32LE(36 + dataSize, 4);
   header.write("WAVE", 8);
   header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);         // PCM header size
-  header.writeUInt16LE(1, 20);          // PCM format
-  header.writeUInt16LE(1, 22);          // channels: mono
-  header.writeUInt32LE(16000, 24);      // sample rate
-  header.writeUInt32LE(byteRate, 28);   // byte rate
-  header.writeUInt16LE(blockAlign, 32); // block align
-  header.writeUInt16LE(16, 34);         // bits per sample
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16000, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(16, 34);
   header.write("data", 36);
   header.writeUInt32LE(dataSize, 40);
   return Buffer.concat([header, pcmBuffer]);
@@ -85,13 +83,10 @@ async function transcribeChunk(pcmChunk) {
   try {
     const wav = pcmToWav16kMono(pcmChunk);
     const file = await toFile(wav, "chunk.wav", { type: "audio/wav" });
-    const tx = await openai.audio.transcriptions.create({
-      file,
-      model: "whisper-1"
-    });
-    const text = tx?.text?.trim();
+    const tx = await openai.audio.transcriptions.create({ file, model: "whisper-1" });
+    const text = tx?.text?.trim() || "";
     if (text) console.log("📝 Whisper:", text);
-    return text || "";
+    return text;
   } catch (e) {
     console.error("🛑 Whisper error:", e?.message || e);
     return "";
@@ -101,7 +96,7 @@ async function transcribeChunk(pcmChunk) {
 async function dpaThink({ latestText, runningTranscript }) {
   try {
     const system = `You are Anna, JP's friendly Australian Digital Personal Assistant.
-Keep replies short, warm, and proactive. Extract intent and suggested next action as JSON like:
+Keep replies short, warm, and proactive. Extract intent and suggested next action as strict JSON:
 {"assistant_reply":"...", "intent":"...", "entities":{...}, "urgency":"low|med|high"}`;
     const res = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -118,18 +113,51 @@ Keep replies short, warm, and proactive. Extract intent and suggested next actio
   }
 }
 
+// End-of-call summary
+async function summarizeCall(transcript) {
+  if (!transcript?.trim()) return null;
+  const system = `You are Anna, JP's Australian Digital Personal Assistant.
+Summarize crisply as strict JSON:
+{"summary":"...", "sentiment":"positive|neutral|negative",
+ "urgency":"low|med|high", "entities":{...}, "action_items":["..."]}`;
+  const res = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: `Full transcript:\n${transcript}` }
+    ]
+  });
+  const text = res.choices?.[0]?.message?.content || "";
+  console.log("🧾 Call Summary:", text);
+  return text;
+}
+
+// Optional email via SendGrid
+async function emailSummary(subject, html) {
+  try {
+    if (!sgMail) return;
+    const apiKey = process.env.SENDGRID_API_KEY;
+    const to = process.env.SUMMARY_TO_EMAIL || "jplamothe15@gmail.com";
+    const from = process.env.SUMMARY_FROM_EMAIL; // e.g. no-reply@digitalpa.io (verified in SendGrid)
+    if (!apiKey || !to || !from) {
+      console.log("📭 Email skipped (missing SENDGRID_API_KEY or SUMMARY_TO_EMAIL or SUMMARY_FROM_EMAIL).");
+      return;
+    }
+    sgMail.setApiKey(apiKey);
+    await sgMail.send({ to, from, subject, html });
+    console.log("📧 Summary emailed to", to);
+  } catch (e) {
+    console.error("Email error:", e?.message || e);
+  }
+}
+
 // ---------- media stream handling ----------
 function startInlineFfmpeg() {
   // ffmpeg -f mulaw -ar 8000 -ac 1 -i pipe:0 -f s16le -ar 16000 -ac 1 pipe:1
   const ff = spawn(ffmpegPath, [
-    "-f", "mulaw",
-    "-ar", "8000",
-    "-ac", "1",
-    "-i", "pipe:0",
-    "-f", "s16le",
-    "-ar", "16000",
-    "-ac", "1",
-    "pipe:1"
+    "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0",
+    "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1"
   ], { stdio: ["pipe", "pipe", "inherit"] });
 
   ff.on("error", (e) => console.error("❌ ffmpeg error:", e));
@@ -142,26 +170,27 @@ wss.on("connection", (ws) => {
 
   const ff = startInlineFfmpeg();
 
-  // --- chunking 16k PCM to ~2s windows for Whisper ---
+  // ~1s chunks to Whisper (at 16kHz * 2 bytes = ~32KB/s)
+  const TARGET_BYTES = 32000;
   let runningTranscript = "";
   let pcmChunkBuffer = [];
   let pcmChunkBytes = 0;
   let flushInFlight = false;
-  const TARGET_BYTES = 32000 * 2; // ~= 2 seconds (32kB/sec * 2)
+
+  // guard so we don't flush after call ends
+  let closing = false;
 
   async function flushChunk() {
-    if (flushInFlight) return;
+    if (closing || flushInFlight) return;
     flushInFlight = true;
     try {
       const chunk = Buffer.concat(pcmChunkBuffer);
       pcmChunkBuffer = [];
       pcmChunkBytes = 0;
       if (chunk.length === 0) return;
-
       const latestText = await transcribeChunk(chunk);
       if (latestText) {
         runningTranscript += (runningTranscript ? " " : "") + latestText;
-        // think about the delta (keeps things snappy)
         dpaThink({ latestText, runningTranscript }).catch(() => {});
       }
     } catch (e) {
@@ -171,75 +200,71 @@ wss.on("connection", (ws) => {
     }
   }
 
-  // the transcoded PCM16k stream from ffmpeg
   ff.stdout.on("data", (chunk) => {
-    // optional: observe PCM flow
-    // console.log(`🎧 PCM16k chunk: ${chunk.length} bytes`);
     pcmChunkBuffer.push(chunk);
     pcmChunkBytes += chunk.length;
-    if (pcmChunkBytes >= TARGET_BYTES) {
-      flushChunk().catch(() => {});
-    }
+    if (pcmChunkBytes >= TARGET_BYTES) flushChunk().catch(() => {});
   });
 
   ws.on("message", (msg) => {
     let data;
-    try {
-      data = JSON.parse(msg.toString("utf8"));
-    } catch (e) {
-      console.error("⚠️ Non-JSON WS frame:", e);
-      return;
-    }
+    try { data = JSON.parse(msg.toString("utf8")); }
+    catch (e) { console.error("⚠️ Non-JSON WS frame:", e); return; }
 
     switch (data.event) {
       case "connected":
-        console.log("📞 Twilio media stream connected");
-        break;
-
+        console.log("📞 Twilio media stream connected"); break;
       case "start":
-        console.log(`🔗 Stream started. streamSid=${data.start?.streamSid || "unknown"}`);
-        break;
-
+        console.log(`🔗 Stream started. streamSid=${data.start?.streamSid || "unknown"}`); break;
       case "media": {
         const b64 = data.media?.payload;
         if (!b64) return;
         const mulaw = Buffer.from(b64, "base64");
         const ok = ff.stdin.write(mulaw);
-        if (!ok) {
-          ws.pause?.();
-          ff.stdin.once("drain", () => ws.resume?.());
-        }
+        if (!ok) { ws.pause?.(); ff.stdin.once("drain", () => ws.resume?.()); }
         break;
       }
-
-      case "mark":
-        break;
-
-      case "stop":
+      case "mark": break;
+      case "stop": {
         console.log("🛑 Twilio signaled stop — closing stream");
+        closing = true;
         try { ff.stdin.end(); } catch {}
-        // flush any remaining audio for a last transcript slice
-        flushChunk().finally(() => ws.close());
+        (async () => {
+          try {
+            // final flush
+            await flushChunk();
+            if (runningTranscript?.trim()) {
+              const summary = await summarizeCall(runningTranscript);
+              await emailSummary("DPA Call Summary", `<pre>${summary}</pre>`);
+            } else {
+              console.log("🧾 No transcript collected; skipping summary.");
+            }
+          } catch (e) {
+            console.error("Finalization error:", e);
+          } finally {
+            try { ws.close(); } catch {}
+          }
+        })();
         break;
-
-      default:
-        break;
+      }
+      default: break;
     }
   });
 
   ws.on("close", () => {
     console.log("❌ WebSocket connection closed");
+    closing = true;
     try { ff.stdin.end(); } catch {}
   });
 
   ws.on("error", (err) => {
     console.error("⚠️ WebSocket error:", err);
+    closing = true;
     try { ff.stdin.end(); } catch {}
     try { ws.close(); } catch {}
   });
 });
 
-// Start server
 server.listen(PORT, () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
