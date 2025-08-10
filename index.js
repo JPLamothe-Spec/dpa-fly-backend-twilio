@@ -1,13 +1,15 @@
-// index.js — Full duplex + 1-turn ASR (Whisper) -> GPT -> TTS reply
+// index.js — Full duplex + optional 1-turn ASR (Whisper) -> GPT -> TTS reply
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const bodyParser = require("body-parser");
-const fetch = require("node-fetch");
 const FormData = require("form-data");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
+
+// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3)
+const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const { startPlaybackFromTTS, startPlaybackTone } = require("./tts");
 
@@ -30,6 +32,7 @@ app.post("/twilio/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
+// Health
 app.get("/", (_req, res) => res.status(200).send("DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
@@ -54,51 +57,51 @@ wss.on("connection", (ws) => {
 
   ws.on("message", async (msg) => {
     let data;
-    try { data = JSON.parse(msg.toString()); } catch (e) { return; }
+    try { data = JSON.parse(msg.toString()); } catch { return; }
 
-    if (data.event === "connected") {
-      console.log("📞 Twilio media stream connected");
-    }
+    switch (data.event) {
+      case "connected":
+        console.log("📞 Twilio media stream connected");
+        break;
 
-    if (data.event === "start") {
-      streamSid = data.start?.streamSid || null;
-      console.log(`🔗 Stream started. streamSid=${streamSid}`);
+      case "start":
+        streamSid = data.start?.streamSid || null;
+        console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
-      // 1) Dynamic greeting (optional) -> TTS
-      const greeting = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
-      if (!process.env.OPENAI_API_KEY) {
-        console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
-        startPlaybackTone({ ws, streamSid, logPrefix: "TONE" }).catch((e) =>
-          console.error("TTS/playback error (tone):", e?.message || e)
-        );
-      } else {
-        console.log("🔊 Playback mode: OpenAI TTS");
-        startPlaybackFromTTS({
-          ws, streamSid, text: greeting,
-          voice: process.env.TTS_VOICE || "alloy",
-          model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
-        }).catch((e) => console.error("TTS/playback error:", e?.message || e));
-      }
+        // Greet (Mode A tone if no key, Mode B OpenAI TTS if key)
+        const greeting = "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
+        if (!process.env.OPENAI_API_KEY) {
+          console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
+          startPlaybackTone({ ws, streamSid, logPrefix: "TONE" })
+            .catch((e) => console.error("TTS/playback error (tone):", e?.message || e));
+        } else {
+          console.log("🔊 Playback mode: OpenAI TTS");
+          startPlaybackFromTTS({
+            ws, streamSid, text: greeting,
+            voice: process.env.TTS_VOICE || "alloy",
+            model: process.env.TTS_MODEL || "gpt-4o-mini-tts",
+          }).catch((e) => console.error("TTS/playback error:", e?.message || e));
+        }
 
-      // 2) Start collecting caller audio right away; after a short window, transcribe + reply
-      startCollecting();
-    }
+        // Start a simple 1-turn collect → transcribe → reply cycle
+        startCollecting();
+        break;
 
-    if (data.event === "media") {
-      // inbound μ-law@8k frames in base64
-      if (collecting && data?.media?.payload) {
-        buffers.push(Buffer.from(data.media.payload, "base64"));
-      }
-    }
+      case "media":
+        if (collecting && data?.media?.payload) {
+          buffers.push(Buffer.from(data.media.payload, "base64"));
+        }
+        break;
 
-    if (data.event === "mark") {
-      // Twilio echoes marks we send after playback
-      // console.log("📍 Twilio mark:", data?.mark?.name);
-    }
+      case "mark":
+        // Twilio echoes marks after it finishes playing our audio
+        // console.log("📍 Twilio mark:", data?.mark?.name);
+        break;
 
-    if (data.event === "stop") {
-      console.log("🛑 Twilio signaled stop — closing stream");
-      try { ws.close(); } catch {}
+      case "stop":
+        console.log("🛑 Twilio signaled stop — closing stream");
+        try { ws.close(); } catch {}
+        break;
     }
   });
 
@@ -113,7 +116,7 @@ wss.on("connection", (ws) => {
     buffers = [];
     if (collectTimer) clearTimeout(collectTimer);
 
-    // Collect ~4 seconds of caller speech, then process one-turn
+    // Collect ~4s of caller speech, then process one-turn
     collectTimer = setTimeout(async () => {
       collecting = false;
       const mulaw = Buffer.concat(buffers);
@@ -157,10 +160,7 @@ function convertMulaw8kToWav16k(mulawBuffer) {
     const p = spawn(ffmpegPath, args);
     const chunks = [];
     p.stdout.on("data", (b) => chunks.push(b));
-    p.on("close", (code) => {
-      if (code === 0) resolve(Buffer.concat(chunks));
-      else reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`));
-    });
+    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`)));
     p.on("error", reject);
     p.stdin.end(mulawBuffer);
   });
