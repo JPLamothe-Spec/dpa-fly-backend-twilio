@@ -1,10 +1,18 @@
 {
-  "dependencies": {
-    "express": "^4",
-    "ws": "^8",
-    "body-parser": "^1",
-    "ffmpeg-static": "^5",
-    "dotenv": "^16"
+  "name": "dpa-fly-backend-twilio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
   },
-  "scripts": { "start": "node index.js" }
+  "dependencies": {
+    "body-parser": "^1.20.3",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ffmpeg-static": "^5.2.0",
+    "openai": "^4.55.0",
+    "ws": "^8.17.1"
+  }
 }
