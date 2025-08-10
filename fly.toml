@@ -1,36 +1,23 @@
-app = "dpa-fly-backend-twilio"
-primary_region = "syd"
+# fly.toml app configuration file generated for dpa-fly-backend-twilio on 2025-08-10T04:10:29Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-[deploy]
-  release_command = ""
-  strategy = "immediate"
+app = 'dpa-fly-backend-twilio'
+primary_region = 'syd'
 
-[experimental]
-  auto_rollback = true
+[build]
 
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = false    # ✅ Don't stop machines automatically
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1      # ✅ Keep one machine always running
-  processes = ["app"]
+  min_machines_running = 0
+  processes = ['app']
 
-[[services]]
-  internal_port = 3000
-  protocol = "tcp"
-
-  [[services.ports]]
-    port = 80
-
-  [[services.ports]]
-    port = 443
-
-  [[services.http_checks]]
-    method = "get"
-    path = "/"
-    protocol = "http"
-
-  [services.tls_options]
-    alpn = ["h2", "http/1.1"]
-    versions = ["TLSv1.3", "TLSv1.2"]
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024
