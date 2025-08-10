@@ -8,6 +8,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@sendgrid/mail": "^8.1.0",
     "body-parser": "^1.20.3",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
