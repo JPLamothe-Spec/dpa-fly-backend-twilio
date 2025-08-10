@@ -25,7 +25,7 @@ app.post("/twilio/voice", (req, res) => {
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="wss://${host}/media-stream"/>
+        <Stream url="wss://${host}/media-stream" track="both_tracks"/>
       </Connect>
     </Response>
   `.trim();
@@ -54,6 +54,7 @@ wss.on("connection", (ws) => {
   let collecting = false;
   let buffers = [];
   let collectTimer = null;
+  let greetingDone = false;
 
   ws.on("message", async (msg) => {
     let data;
@@ -96,6 +97,9 @@ wss.on("connection", (ws) => {
       case "mark":
         // Twilio echoes marks after it finishes playing our audio
         console.log("📍 Twilio mark:", data?.mark?.name);
+        if (data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") {
+          greetingDone = true;
+        }
         break;
 
       case "stop":
@@ -131,6 +135,12 @@ wss.on("connection", (ws) => {
 
         const reply = await generateReply(transcript);
         console.log("🤖 GPT reply:", reply);
+
+        // If greeting hasn't completed, wait briefly for mark; otherwise, continue.
+        const waitUntil = Date.now() + 2000; // up to ~2s
+        while (!greetingDone && Date.now() < waitUntil) {
+          await new Promise(r => setTimeout(r, 50));
+        }
 
         await startPlaybackFromTTS({
           ws, streamSid, text: reply,
