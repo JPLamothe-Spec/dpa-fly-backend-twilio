@@ -1,7 +1,7 @@
-import fetch from "node-fetch";
+const fetch = require("node-fetch");
 
-// Returns 16kHz PCM Buffer for Twilio
-export async function ttsToPCM(text) {
+// Returns MP3 Buffer for OpenAI TTS
+async function ttsToMp3(text) {
   const voice = process.env.TTS_VOICE || "alloy";
   const model = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
@@ -9,15 +9,15 @@ export async function ttsToPCM(text) {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
       model,
       voice,
       input: text,
-      format: "pcm",
-      sample_rate: 16000,
-    }),
+      format: "mp3",
+      sample_rate: 24000
+    })
   });
 
   if (!r.ok) {
@@ -28,3 +28,5 @@ export async function ttsToPCM(text) {
   const arrayBuf = await r.arrayBuffer();
   return Buffer.from(arrayBuf);
 }
+
+module.exports = { ttsToMp3 };
