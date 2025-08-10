@@ -1,4 +1,4 @@
-// tts.js — paced outbound μ-law using ffmpeg-static; Twilio infers track from TwiML
+// tts.js — paced outbound μ-law using ffmpeg-static (+gain, silence tail)
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
@@ -30,7 +30,7 @@ function sendMark(ws, streamSid, name) {
 }
 
 // Build 20ms frames and pace them; append a short μ-law silence tail to ensure clean end
-function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true } = {}) {
+function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true, tailMs = 600 } = {}) {
   return new Promise((resolve) => {
     const frames = [];
     for (let i = 0; i < mulawBuffer.length; i += FRAME_BYTES) {
@@ -43,59 +43,44 @@ function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true } 
         frames.push(frame);
       }
     }
-
     if (addSilenceTail) {
-      // ~200ms of silence to help Twilio finalize playback
-      const tailFrames = Math.ceil(200 / FRAME_MS);
-      for (let i = 0; i < tailFrames; i++) {
-        frames.push(Buffer.alloc(FRAME_BYTES, 0x7f));
-      }
+      const tailFrames = Math.ceil(tailMs / FRAME_MS);
+      for (let i = 0; i < tailFrames; i++) frames.push(Buffer.alloc(FRAME_BYTES, 0x7f));
     }
 
     let idx = 0;
     const timer = setInterval(() => {
-      if (!ws || ws.readyState !== ws.OPEN) {
-        clearInterval(timer);
-        return resolve();
-      }
-      if (idx >= frames.length) {
-        clearInterval(timer);
-        return resolve();
-      }
+      if (!ws || ws.readyState !== ws.OPEN) { clearInterval(timer); return resolve(); }
+      if (idx >= frames.length) { clearInterval(timer); return resolve(); }
       sendMediaFrame(ws, streamSid, frames[idx++]);
     }, FRAME_MS);
   });
 }
 
-// Mode A: simple tone to prove outbound audio path
+// Tone playback with gain
 async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPrefix = "TONE" }) {
   return new Promise((resolve, reject) => {
     const args = [
-      "-f", "lavfi",
-      "-i", `sine=frequency=${freq}:duration=${seconds}`,
-      "-ar", "8000",
-      "-ac", "1",
-      "-f", "mulaw",
-      "pipe:1",
+      "-f","lavfi","-i",`sine=frequency=${freq}:duration=${seconds}`,
+      "-filter:a","volume=2.0",      // +6 dB gain
+      "-ar","8000","-ac","1","-f","mulaw","pipe:1"
     ];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
-    p.stdout.on("data", (buf) => { chunks.push(buf); });
-    p.stderr.on("data", () => {});
-
+    p.stdout.on("data", (buf) => chunks.push(buf));
     p.on("close", async (code) => {
       if (code !== 0) return reject(new Error(`${logPrefix} ffmpeg exited with code ${code}`));
       const out = Buffer.concat(chunks);
-      await paceAndSendMuLaw(ws, streamSid, out);
+      await paceAndSendMuLaw(ws, streamSid, out, { tailMs: 600 });
       sendMark(ws, streamSid, `${logPrefix}-done`);
-      console.log(`${logPrefix}: sent ~${out.length} bytes μ-law (paced)`);
+      console.log(`${logPrefix}: sent ~${out.length} bytes μ-law (paced, +gain)`);
       resolve();
     });
     p.on("error", reject);
   });
 }
 
-// Mode B: OpenAI TTS -> μ-law@8k -> stream to Twilio
+// OpenAI TTS with gain
 async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for TTS mode");
 
@@ -111,20 +96,22 @@ async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", mode
   if (!resp.ok) throw new Error(`OpenAI TTS failed: ${resp.status} ${await resp.text().catch(() => "")}`);
   const mp3Buffer = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Transcode MP3 -> μ-law@8k and stream frames
+  // 2) Transcode MP3 -> μ-law@8k, boost gain, then pace to Twilio
   return new Promise((resolve, reject) => {
-    const args = ["-i","pipe:0","-ar","8000","-ac","1","-f","mulaw","pipe:1"];
+    const args = [
+      "-i","pipe:0",
+      "-filter:a","volume=2.0",      // +6 dB gain before μ-law
+      "-ar","8000","-ac","1","-f","mulaw","pipe:1"
+    ];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
-    p.stdout.on("data", (buf) => { chunks.push(buf); });
-    p.stderr.on("data", () => {});
-
+    p.stdout.on("data", (buf) => chunks.push(buf));
     p.on("close", async (code) => {
       if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
       const out = Buffer.concat(chunks);
-      await paceAndSendMuLaw(ws, streamSid, out);
+      await paceAndSendMuLaw(ws, streamSid, out, { tailMs: 600 });
       sendMark(ws, streamSid, "tts-done");
-      console.log(`TTS: sent ~${out.length} bytes μ-law (paced)`);
+      console.log(`TTS: sent ~${out.length} bytes μ-law (paced, +gain)`);
       resolve();
     });
     p.on("error", reject);
