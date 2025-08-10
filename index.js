@@ -1,57 +1,49 @@
-// index.js
-import express from 'express';
-import http from 'http';
-import WebSocket from 'ws';
-import bodyParser from 'body-parser';
-import dotenv from 'dotenv';
-dotenv.config();
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const bodyParser = require("body-parser");
+require("dotenv").config();
 
-import { handleStream } from './stream-handler.js';
+const { handleStream } = require("./stream-handler");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+
+const PORT = process.env.PORT || 3000;
 
 // ✅ Health check endpoint for Fly.io
-app.get('/health', (req, res) => res.send('ok'));
+app.get("/health", (req, res) => res.send("ok"));
+
+// ✅ Basic landing endpoint
+app.get("/", (req, res) => res.send("DPA backend (Twilio inline ffmpeg) is live ✅"));
 
 // ✅ Twilio webhook to start streaming
-app.post('/twilio/voice', (req, res) => {
-  console.log('📞 Incoming Twilio Voice webhook hit');
-
-  const host = req.headers.host;
+app.post("/twilio/voice", (req, res) => {
   const twiml = `
     <Response>
       <Start>
-        <Stream url="wss://${host}/media-stream" track="inbound_track" />
+        <Stream url="wss://${req.headers.host}/media-stream" track="inbound_track" />
       </Start>
-      <Pause length="30" />
+      <Pause length="60"/>
     </Response>
   `;
-
-  res.type('text/xml');
+  res.type("text/xml");
   res.send(twiml.trim());
 });
 
-// ✅ Create HTTP server
+// ✅ HTTP server + WebSocket server
 const server = http.createServer(app);
-
-// ✅ WebSocket server (noServer mode for manual upgrade)
 const wss = new WebSocket.Server({ noServer: true });
 
-server.on('upgrade', (req, socket, head) => {
-  if (req.url === '/media-stream') {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      console.log('✅ WebSocket connection established with Twilio');
+server.on("upgrade", (request, socket, head) => {
+  if (request.url === "/media-stream") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      console.log("✅ Twilio WebSocket connected");
       handleStream(ws);
     });
-  } else {
-    socket.destroy();
   }
 });
 
-// ✅ Start server
-const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
