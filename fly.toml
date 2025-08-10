@@ -1,8 +1,5 @@
 app = "dpa-fly-backend-twilio"
 
-[build]
-  image = "node:18-bullseye"
-
 [env]
   PORT = "3000"
 
