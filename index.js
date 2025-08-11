@@ -1,10 +1,4 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end, proactive greeting)
-// - Streams μ-law in/out (no ffmpeg, no resampling)
-// - Proactive greeting on stream "start" so you hear Anna immediately
-// - Adds track="inbound_audio" to TwiML for clarity
-// - Extra logging for Twilio events
-// - UK-leaning female voice via VOICE=verse (or try VOICE=sage)
-// - Built-in dev/project brief; clean shutdown on hangup
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end, robust TwiML + logging)
 
 const express = require("express");
 const http = require("http");
@@ -19,64 +13,108 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 
 /* ===== Config ===== */
-const PUBLIC_URL = process.env.PUBLIC_URL || "";
+const STREAM_WS_URL = process.env.STREAM_WS_URL || ""; // e.g. wss://dpa-fly-backend-twilio.fly.dev/call  (hard override)
+const PUBLIC_URL    = process.env.PUBLIC_URL || "";    // e.g. https://dpa-fly-backend-twilio.fly.dev
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const VOICE = (process.env.VOICE || "verse").toLowerCase(); // "verse" or "sage"
+const VOICE = (process.env.VOICE || "verse").toLowerCase();
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 const MAINTENANCE_MODE = String(process.env.MAINTENANCE_MODE || "false").toLowerCase() === "true";
 
-/* ===== VAD / turn-taking ===== */
+/* ===== VAD ===== */
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);
 
-/* ===== Project brief (inline) ===== */
-const PROJECT_BRIEF =
-  process.env.PROJECT_BRIEF ||
-  `Digital Personal Assistant (DPA) Project
+/* ===== Brief ===== */
+const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA) Project
 - Goal: natural, low-latency phone assistant for JP.
 - Priorities: realtime voice, UK/AU female voice, no unsolicited number capture, low latency, smooth barge-in.
 - Dev mode: treat caller as JP (teammate). Be concise, flag issues (latency, transcription, overlap), suggest next tests.
 - Behaviours: avoid asking for phone numbers unless explicitly requested. Keep replies short unless asked to elaborate.`;
 
 /* ===== Helpers ===== */
-function ulawEnergy(buf) { let s=0; for (let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
-
-/* ===== Twilio webhook -> TwiML that opens media stream ===== */
-app.post("/twilio/voice", (req, res) => {
-  if (MAINTENANCE_MODE) {
-    console.log("🚫 MAINTENANCE_MODE active — rejecting call");
-    return res.type("text/xml").send(`<Response><Reject/></Response>`);
+function ulawEnergy(buf){ let s=0; for(let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
+function toWssBase(urlLike, fallbackHost) {
+  if (!urlLike) return `wss://${fallbackHost}`;
+  // Accept ws://, wss://, http://, https://
+  try {
+    const u = new URL(urlLike);
+    if (u.protocol === "wss:" || u.protocol === "ws:") {
+      // ensure wss
+      u.protocol = "wss:";
+      return u.toString().replace(/\/+$/, "");
+    }
+    if (u.protocol === "https:" || u.protocol === "http:") {
+      u.protocol = "wss:";
+      return u.toString().replace(/\/+$/, "");
+    }
+  } catch (_) {
+    // not a full URL; assume host
+    return `wss://${urlLike}`;
   }
-  console.log("➡️ /twilio/voice hit");
+  return `wss://${fallbackHost}`;
+}
+function ensureCallPath(wssBase) {
+  try {
+    const u = new URL(wssBase);
+    if (!u.pathname || u.pathname === "/") {
+      u.pathname = "/call";
+      return u.toString();
+    }
+    // if path doesn't end with /call, append
+    if (!u.pathname.endsWith("/call")) {
+      u.pathname = (u.pathname.replace(/\/+$/, "")) + "/call";
+    }
+    return u.toString();
+  } catch { return wssBase.endsWith("/call") ? wssBase : `${wssBase.replace(/\/+$/, "")}/call`; }
+}
 
-  const incomingHost = req.headers.host;
-  const base =
-    PUBLIC_URL && /^https?:\/\/[^<>\s]+$/i.test(PUBLIC_URL)
-      ? PUBLIC_URL
-      : `https://${incomingHost}`;
+/* ===== TwiML builder (used by both GET/POST) ===== */
+function buildTwiml(req) {
+  if (MAINTENANCE_MODE) return `<Response><Reject/></Response>`;
 
-  const wsBase = base.startsWith("https://")
-    ? base.replace("https://", "wss://")
-    : base.startsWith("http://")
-    ? base.replace("http://", "ws://")
-    : `wss://${incomingHost}`;
+  const incomingHost = req.headers.host; // e.g. dpa-fly-backend-twilio.fly.dev
+  let wssBase;
 
-  // Add track="inbound_audio" to make the stream intent explicit
+  if (STREAM_WS_URL) {
+    // Hard override (best for debugging)
+    if (!/^wss?:\/\//i.test(STREAM_WS_URL)) {
+      wssBase = `wss://${STREAM_WS_URL}`;
+    } else {
+      wssBase = STREAM_WS_URL;
+    }
+  } else if (PUBLIC_URL) {
+    wssBase = toWssBase(PUBLIC_URL, incomingHost);
+  } else {
+    wssBase = `wss://${incomingHost}`;
+  }
+
+  const finalWss = ensureCallPath(wssBase);
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="${wsBase}/call" track="inbound_audio"/>
+        <Stream url="${finalWss}" track="inbound_audio"/>
       </Connect>
     </Response>
   `.trim();
 
-  res.type("text/xml").send(twiml);
+  console.log("🧾 TwiML returned:", twiml);
+  return twiml;
+}
+
+/* ===== Twilio webhook (support POST + GET just in case) ===== */
+app.post("/twilio/voice", (req, res) => {
+  console.log("➡️ /twilio/voice hit (POST)");
+  res.type("text/xml").send(buildTwiml(req));
+});
+app.get("/twilio/voice", (req, res) => {
+  console.log("➡️ /twilio/voice hit (GET)");
+  res.type("text/xml").send(buildTwiml(req));
 });
 
-/* ===== Health ===== */
+/* Health */
 app.get("/", (_req, res) => res.status(200).send("Realtime DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
@@ -119,14 +157,13 @@ wss.on("connection", async (twilioWS) => {
   let callEnded = false;
   let streamSid = null;
 
-  // VAD / turn state
-  let collecting = false;
+  // VAD / buffer
   let mulawChunks = [];
   let lastSpeechAt = Date.now();
   let turnStartedAt = 0;
   let vadPoll = null;
 
-  // Connect to OpenAI Realtime
+  // Connect to OpenAI
   let oaiWS;
   try {
     oaiWS = await connectOpenAIRealtime();
@@ -136,7 +173,7 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // Realtime -> Twilio: stream μ-law audio back
+  // OAI -> Twilio audio
   oaiWS.on("message", (data) => {
     if (callEnded) return;
     try {
@@ -162,13 +199,12 @@ wss.on("connection", async (twilioWS) => {
     callEnded = true;
     console.log("🛑 Ending call:", reason);
     try { if (vadPoll) { clearInterval(vadPoll); vadPoll = null; } } catch {}
-    collecting = false;
     mulawChunks = [];
     try { if (oaiWS && oaiWS.readyState === WebSocket.OPEN) oaiWS.close(); } catch {}
     try { if (twilioWS && twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
   }
 
-  // Session setup (strings only; no sample-rate fields)
+  // Send session setup
   function sendSessionUpdate() {
     const instructions = DEV_MODE
       ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
@@ -181,7 +217,7 @@ ${PROJECT_BRIEF}`
     const sess = {
       type: "session.update",
       session: {
-        input_audio_format:  "g711_ulaw", // μ-law @ 8k implied
+        input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
         modalities: ["audio", "text"],
         voice: VOICE,
@@ -197,11 +233,7 @@ ${PROJECT_BRIEF}`
     if (callEnded) return;
     let data; try { data = JSON.parse(raw.toString()); } catch { return; }
 
-    // Extra visibility for unexpected events
-    if (!data.event) {
-      console.log("ℹ️ Twilio message without event:", data);
-      return;
-    }
+    if (!data.event) { console.log("ℹ️ Twilio message without event:", data); return; }
 
     switch (data.event) {
       case "connected":
@@ -211,25 +243,17 @@ ${PROJECT_BRIEF}`
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid} voice=${VOICE} model=${REALTIME_MODEL} dev=${DEV_MODE}`);
-
-        collecting = true;
         mulawChunks = [];
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
 
-        // 🔊 Proactive greeting: ask Realtime to speak right away
+        // Proactive greeting
         try {
-          oaiWS.send(JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio"] }
-          }));
-        } catch (e) {
-          console.error("❌ initial greeting failed:", e?.message || e);
-        }
+          oaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
+        } catch (e) { console.error("❌ initial greeting failed:", e?.message || e); }
 
         if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
         vadPoll = setInterval(() => {
-          if (callEnded || !collecting) return;
           const now = Date.now();
           const longSilence = (now - lastSpeechAt) >= SILENCE_MS;
           const hitMax = (now - turnStartedAt) >= MAX_TURN_MS;
@@ -254,18 +278,13 @@ ${PROJECT_BRIEF}`
         const b64 = data?.media?.payload;
         if (!b64) break;
         const mulaw = Buffer.from(b64, "base64");
-
-        // VAD
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
-
-        // Accumulate raw μ-law for this turn
         mulawChunks.push(mulaw);
         break;
       }
 
       case "mark":
-        // observe "tts-done" if desired
         break;
 
       case "stop":
