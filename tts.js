@@ -1,5 +1,4 @@
 // tts.js — OpenAI TTS playback helpers with caching + μ-law pacing
-const { v4: uuidv4 } = require("uuid");
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const DEFAULT_VOICE = process.env.TTS_VOICE || "verse";          // British female by default
