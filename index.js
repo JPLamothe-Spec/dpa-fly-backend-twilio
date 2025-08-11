@@ -1,8 +1,10 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end)
-// - Fully streaming both ways (no batch TTS/Whisper, no resampling)
-// - input_audio_format: g711_ulaw, output_audio_format: g711_ulaw
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end, proactive greeting)
+// - Streams μ-law in/out (no ffmpeg, no resampling)
+// - Proactive greeting on stream "start" so you hear Anna immediately
+// - Adds track="inbound_audio" to TwiML for clarity
+// - Extra logging for Twilio events
 // - UK-leaning female voice via VOICE=verse (or try VOICE=sage)
-// - Built-in dev/project brief; robust TwiML URL; clean shutdown on hangup
+// - Built-in dev/project brief; clean shutdown on hangup
 
 const express = require("express");
 const http = require("http");
@@ -17,21 +19,20 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 
 /* ===== Config ===== */
-const PUBLIC_URL = process.env.PUBLIC_URL || ""; // e.g. https://dpa-fly-backend-twilio.fly.dev
+const PUBLIC_URL = process.env.PUBLIC_URL || "";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const REALTIME_MODEL =
-  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const VOICE = (process.env.VOICE || "verse").toLowerCase(); // "verse" or "sage"
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 const MAINTENANCE_MODE = String(process.env.MAINTENANCE_MODE || "false").toLowerCase() === "true";
 
-/* ===== VAD / turn-taking (μ-law energy) ===== */
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);   // avg μ-law energy
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);   // end turn after ~1.1s silence
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);  // cap per turn
+/* ===== VAD / turn-taking ===== */
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);
 
-/* ===== Built-in project brief (override via env PROJECT_BRIEF) ===== */
+/* ===== Project brief (inline) ===== */
 const PROJECT_BRIEF =
   process.env.PROJECT_BRIEF ||
   `Digital Personal Assistant (DPA) Project
@@ -63,10 +64,11 @@ app.post("/twilio/voice", (req, res) => {
     ? base.replace("http://", "ws://")
     : `wss://${incomingHost}`;
 
+  // Add track="inbound_audio" to make the stream intent explicit
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="${wsBase}/call"/>
+        <Stream url="${wsBase}/call" track="inbound_audio"/>
       </Connect>
     </Response>
   `.trim();
@@ -117,14 +119,14 @@ wss.on("connection", async (twilioWS) => {
   let callEnded = false;
   let streamSid = null;
 
-  // VAD state
+  // VAD / turn state
   let collecting = false;
-  let mulawChunks = [];            // store μ-law frames directly
+  let mulawChunks = [];
   let lastSpeechAt = Date.now();
   let turnStartedAt = 0;
   let vadPoll = null;
 
-  // Connect to OpenAI
+  // Connect to OpenAI Realtime
   let oaiWS;
   try {
     oaiWS = await connectOpenAIRealtime();
@@ -150,7 +152,9 @@ wss.on("connection", async (twilioWS) => {
         twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } }));
       }
       if (msg.type === "error") console.error("🔻 OAI error:", msg);
-    } catch {}
+    } catch (e) {
+      console.error("⚠️ Failed to parse OAI message", e?.message || e);
+    }
   });
 
   function endCall(reason="unknown") {
@@ -164,7 +168,7 @@ wss.on("connection", async (twilioWS) => {
     try { if (twilioWS && twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
   }
 
-  // Send session setup (strings only; no sample-rate fields)
+  // Session setup (strings only; no sample-rate fields)
   function sendSessionUpdate() {
     const instructions = DEV_MODE
       ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
@@ -177,8 +181,8 @@ ${PROJECT_BRIEF}`
     const sess = {
       type: "session.update",
       session: {
-        input_audio_format:  "g711_ulaw", // Twilio -> us -> OpenAI (μ-law @ 8k implied)
-        output_audio_format: "g711_ulaw", // OpenAI -> us -> Twilio
+        input_audio_format:  "g711_ulaw", // μ-law @ 8k implied
+        output_audio_format: "g711_ulaw",
         modalities: ["audio", "text"],
         voice: VOICE,
         instructions
@@ -193,6 +197,12 @@ ${PROJECT_BRIEF}`
     if (callEnded) return;
     let data; try { data = JSON.parse(raw.toString()); } catch { return; }
 
+    // Extra visibility for unexpected events
+    if (!data.event) {
+      console.log("ℹ️ Twilio message without event:", data);
+      return;
+    }
+
     switch (data.event) {
       case "connected":
         console.log("📞 Twilio media stream connected");
@@ -206,6 +216,16 @@ ${PROJECT_BRIEF}`
         mulawChunks = [];
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
+
+        // 🔊 Proactive greeting: ask Realtime to speak right away
+        try {
+          oaiWS.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio"] }
+          }));
+        } catch (e) {
+          console.error("❌ initial greeting failed:", e?.message || e);
+        }
 
         if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
         vadPoll = setInterval(() => {
@@ -239,17 +259,21 @@ ${PROJECT_BRIEF}`
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
 
-        // Store raw μ-law for this turn (no conversion)
+        // Accumulate raw μ-law for this turn
         mulawChunks.push(mulaw);
         break;
       }
 
       case "mark":
-        // optional: observe "tts-done"
+        // observe "tts-done" if desired
         break;
 
       case "stop":
         endCall("twilio stop");
+        break;
+
+      default:
+        console.log("ℹ️ Unhandled Twilio event:", data.event);
         break;
     }
   });
