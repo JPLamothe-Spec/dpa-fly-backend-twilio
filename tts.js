@@ -3,9 +3,10 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
+// Supported OpenAI voice names. Female-leaning: "verse", "sage", "fable", "nova", "shimmer"
 const VALID_VOICES = new Set(["alloy","ash","ballad","coral","echo","fable","nova","onyx","sage","shimmer","verse"]);
 const envVoice = (process.env.TTS_VOICE || "verse").toLowerCase();
-const DEFAULT_VOICE = VALID_VOICES.has(envVoice) ? envVoice : "verse"; // fall back safely
+const DEFAULT_VOICE = VALID_VOICES.has(envVoice) ? envVoice : "verse";
 const DEFAULT_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
 console.log(`🎙️ TTS voice=${DEFAULT_VOICE} model=${DEFAULT_MODEL}`);
@@ -19,7 +20,7 @@ class TtsController {
 
 /** OpenAI TTS -> WAV (PCM16 @ 8kHz) */
 async function synthesizeWav({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODEL }) {
-  if (!VALID_VOICES.has(voice)) voice = DEFAULT_VOICE; // guard at runtime too
+  if (!VALID_VOICES.has(voice)) voice = DEFAULT_VOICE;
   const r = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -50,12 +51,13 @@ async function playMulawBuffer({ ws, streamSid, buffer, controller, logPrefix = 
   const CHUNK = 160; // 20ms @ 8k μ-law
   let offset = 0;
   while (offset < buffer.length && !(controller && controller.cancelled)) {
+    if (!ws || ws.readyState !== 1) break; // guard on CLOSE
     const slice = buffer.subarray(offset, offset + CHUNK);
     ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: slice.toString("base64") } }));
     offset += CHUNK;
     await new Promise(r => setTimeout(r, 20));
   }
-  if (!(controller && controller.cancelled)) {
+  if (!(controller && controller.cancelled) && ws && ws.readyState === 1) {
     ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } }));
     console.log(`${logPrefix}: sent ~${buffer.length} bytes RAW μ-law (paced)`);
   }
@@ -92,7 +94,7 @@ function clearGreetingCache() {
   console.log("🧹 TTS greeting cache cleared");
 }
 
-// Minimal fallback (neutral buffer) if no API key set
+// Fallback tone if no API key set
 async function startPlaybackTone({ ws, streamSid, controller, logPrefix = "TONE" }) {
   const silence = Buffer.alloc(8000 / 2);
   await playMulawBuffer({ ws, streamSid, buffer: silence, controller, logPrefix });
