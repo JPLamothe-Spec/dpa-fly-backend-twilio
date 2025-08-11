@@ -1,8 +1,8 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (WS bridge)
 // - Live streaming voice both ways (no batch TTS/Whisper)
-// - Natural barge-in and turn-taking
 // - UK-leaning female voice via VOICE=verse (or sage)
-// - Built-in dev-mode project brief (no extra file)
+// - Built-in dev-mode project brief
+// - Robust TwiML URL builder (uses PUBLIC_URL if valid, else request host)
 // - Clean shutdown on hangup
 
 const express = require("express");
@@ -13,8 +13,6 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
@@ -22,7 +20,7 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 
 // ===== Config =====
-const PUBLIC_URL = process.env.PUBLIC_URL || ""; // e.g. https://your-app.fly.dev
+const PUBLIC_URL = process.env.PUBLIC_URL || ""; // e.g. https://dpa-fly-backend-twilio.fly.dev
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 const VOICE = (process.env.VOICE || "verse").toLowerCase(); // try "verse" or "sage"
@@ -35,7 +33,7 @@ const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);  // μ-law en
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);  // end turn after ~1.1s silence
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000); // hard cap per turn
 
-// ===== Built-in project brief (override via env PROJECT_BRIEF if you like) =====
+// ===== Built-in project brief (can override with env PROJECT_BRIEF) =====
 const PROJECT_BRIEF =
   process.env.PROJECT_BRIEF ||
   `Digital Personal Assistant (DPA) Project
@@ -51,23 +49,36 @@ function ulawEnergy(buf) {
   return acc / buf.length;
 }
 
-// ===== Twilio webhook returns TwiML to open the media stream =====
+// ===== Twilio webhook: return TwiML with a valid wss:// URL =====
 app.post("/twilio/voice", (req, res) => {
   if (MAINTENANCE_MODE) {
     console.log("🚫 MAINTENANCE_MODE active — rejecting call");
     return res.type("text/xml").send(`<Response><Reject/></Response>`);
   }
   console.log("➡️ /twilio/voice hit");
-  const host = req.headers.host;
-  const base = PUBLIC_URL || `https://${host}`;
-  const wsUrl = base.replace(/^http/i, "ws");
+
+  const incomingHost = req.headers.host;
+  // Prefer PUBLIC_URL if it looks like a real http(s) URL, else fall back to this request host
+  const base =
+    PUBLIC_URL && /^https?:\/\/[^<>\s]+$/i.test(PUBLIC_URL)
+      ? PUBLIC_URL
+      : `https://${incomingHost}`;
+
+  // Force correct ws scheme (Twilio needs wss:// in production)
+  const wsBase = base.startsWith("https://")
+    ? base.replace("https://", "wss://")
+    : base.startsWith("http://")
+    ? base.replace("http://", "ws://")
+    : `wss://${incomingHost}`;
+
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="${wsUrl}/call"/>
+        <Stream url="${wsBase}/call"/>
       </Connect>
     </Response>
   `.trim();
+
   res.type("text/xml").send(twiml);
 });
 
@@ -101,7 +112,7 @@ function connectOpenAIRealtime() {
   });
 }
 
-// μ-law 8k → PCM16 16k (for OpenAI input)
+// μ-law 8k → PCM16 16k (OpenAI input)
 function ulaw8kToPcm16k(mulawBuffer) {
   return new Promise((resolve, reject) => {
     const args = [
