@@ -1,6 +1,6 @@
-// index.js — Stable duplex: cached greeting (no early cancel), optional barge-in (OFF by default),
-// Whisper ASR → GPT (with hybrid intent incl. AU phone capture + decline) → TTS replies,
-// Dev Mode toggle by voice; when ON, assume caller is JP and converse naturally to improve DPA.
+// index.js — Stable duplex: cached greeting (no early cancel), optional barge-in (OFF by default)
+// Whisper ASR → GPT (hybrid intents; phone capture feature-flagged OFF) → TTS replies
+// Dev Mode ON by default (env) and assumes caller is JP; speaks naturally to help us iterate.
 
 const express = require("express");
 const http = require("http");
@@ -11,7 +11,7 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// ESM-friendly fetch shim for node-fetch v3 in CJS
+// fetch (CJS-friendly)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const {
@@ -28,20 +28,21 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ---- Config (env-overridable)
+/* =======================
+   Config (env-overridable)
+   ======================= */
 const GREETING_TEXT =
   process.env.GREETING_TEXT ||
   "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
 
-// 🔊 British-accented female by default
-const TTS_VOICE  = process.env.TTS_VOICE  || "verse";
-const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts";
+// Voice
+const TTS_VOICE  = process.env.TTS_VOICE  || "verse";           // British female
+const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts"; // OpenAI TTS model
 
-// Barge-in defaults OFF for stability
-const BARGE_IN_ENABLED =
-  String(process.env.BARGE_IN_ENABLED || "false").toLowerCase() === "true";
+// Barge-in (kept OFF for stability)
+const BARGE_IN_ENABLED = String(process.env.BARGE_IN_ENABLED || "false").toLowerCase() === "true";
 const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 22);
-const HOT_FRAMES    = Number(process.env.BARGE_IN_FRAMES || 8);
+const HOT_FRAMES    = Number(process.env_BARGE_IN_FRAMES || process.env.BARGE_IN_FRAMES || 8); // ~160ms
 const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 500);
 
 // Greeting safety
@@ -51,24 +52,15 @@ const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
 const GOODBYE_GUARD_WINDOW_MS = Number(process.env.GOODBYE_GUARD_WINDOW_MS || 2500);
 const GOODBYE_MIN_TOKENS      = Number(process.env.GOODBYE_MIN_TOKENS || 4);
 
-// Dev Mode default from env; per-call voice toggle can override
-const ANNA_DEV_MODE_DEFAULT =
-  String(process.env.ANNA_DEV_MODE || "false").toLowerCase() === "true";
-
-// Treat the dev-mode caller as this name
+// Dev Mode (default from env)
+const ANNA_DEV_MODE_DEFAULT = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true"; // ✅ default ON
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// ---------- μ-law energy helper (for optional barge-in)
-function ulawEnergy(buf) {
-  let acc = 0;
-  for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
-  return acc / buf.length;
-}
+// Phone capture feature flag (default OFF)
+const PHONE_CAPTURE_ENABLED = String(process.env.PHONE_CAPTURE_ENABLED || "false").toLowerCase() === "true";
 
-// ---- Phone capture helpers (AU-focused) ----
+// AU phone capture helpers
 const AU_MOBILE_LEN = 10;
-
-// Avoid collision-prone homophones
 const DIGIT_WORDS = {
   "zero": "0", "oh": "0", "o": "0",
   "one": "1",
@@ -90,7 +82,6 @@ function tokensFrom(text) {
     .split(/\s+/)
     .filter(Boolean);
 }
-
 function extractDigitsFromTranscript(text) {
   const out = [];
   const toks = tokensFrom(text);
@@ -107,25 +98,31 @@ function extractDigitsFromTranscript(text) {
   }
   return out.join("");
 }
-
 function formatAuMobile(digits) {
   const d = digits.slice(0, AU_MOBILE_LEN);
   if (d.length < 4) return d;
   if (d.length <= 7) return `${d.slice(0,4)} ${d.slice(4)}`;
   return `${d.slice(0,4)} ${d.slice(4,7)} ${d.slice(7)}`;
 }
-
 function looksLikePhoneIntent(text = "") {
   const t = (text || "").toLowerCase();
   return /\b(my (mobile|cell|number|phone)|call me( back)? on|reach me on|you can call me on|it's|is|^0?4|oh four|zero four|o four)\b/.test(t);
 }
-
 function userCancelsNumberMode(text = "") {
   const t = (text || "").toLowerCase();
   return /\b(not digits|stop digits|cancel number|no number|ignore number|not giving (you )?my number|i'?m not (trying to )?say digits|don'?t take my number)\b/.test(t);
 }
 
-// --- Twilio webhook: <Connect><Stream>
+// μ-law energy helper (optional barge-in)
+function ulawEnergy(buf) {
+  let acc = 0;
+  for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
+  return acc / buf.length;
+}
+
+/* ==============
+   Twilio webhook
+   ============== */
 app.post("/twilio/voice", (req, res) => {
   console.log("➡️ /twilio/voice hit");
   const host = req.headers.host;
@@ -145,7 +142,9 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const server = http.createServer(app);
 
-// ---- WebSocket
+/* ==========
+   WebSocket
+   ========== */
 const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (request, socket, head) => {
   if (request.url === "/media-stream") {
@@ -181,7 +180,11 @@ wss.on("connection", (ws) => {
 
   // Dev Mode per call
   let devModeActive = ANNA_DEV_MODE_DEFAULT;
-  let devKnownName = null;
+  let devKnownName = devModeActive ? DEV_CALLER_NAME : null;
+
+  if (ANNA_DEV_MODE_DEFAULT) {
+    console.log("🛠️ Dev mode ENABLED (startup); assuming caller is", DEV_CALLER_NAME);
+  }
 
   ws.on("message", async (msg) => {
     let data;
@@ -195,6 +198,7 @@ wss.on("connection", (ws) => {
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
+        console.log(`🔧 Runtime: devMode=${devModeActive} phoneCapture=${PHONE_CAPTURE_ENABLED} voice=${TTS_VOICE}`);
 
         // Greeting
         if (!process.env.OPENAI_API_KEY) {
@@ -281,7 +285,9 @@ wss.on("connection", (ws) => {
     try { ws.close(); } catch {}
   });
 
-  // ----- Collect → ASR → intents/dev/phone → GPT → TTS -----
+  /* ============================================
+     Collect → ASR → intents/dev/phone → GPT → TTS
+     ============================================ */
   function startCollectingWindow(ms) {
     stopCollecting();
     collecting = true;
@@ -293,7 +299,7 @@ wss.on("connection", (ws) => {
       const mulaw = Buffer.concat(buffers);
       buffers = [];
 
-      const isLikelySilence = mulaw.length < (160 * 10);
+      const isLikelySilence = mulaw.length < (160 * 10); // ~200ms @ 8k μ-law
       if (isLikelySilence && collectAttempts < 2) {
         console.log("🤫 Low audio captured — extending collection window");
         return startCollectingWindow(5000);
@@ -301,8 +307,6 @@ wss.on("connection", (ws) => {
 
       try {
         const wav16k = await convertMulaw8kToWav16k(mulaw);
-
-        // Whisper with better bias
         const transcriptRaw = await transcribeWithWhisper(wav16k, {
           language: "en",
           prompt:
@@ -324,8 +328,8 @@ wss.on("connection", (ws) => {
           return startCollectingWindow(5000);
         }
 
-        // === Phone capture (disabled in dev mode) ===
-        if (devModeActive) {
+        // === Phone capture (OFF in dev mode OR when feature disabled) ===
+        if (devModeActive || !PHONE_CAPTURE_ENABLED) {
           expectingPhone = false;
           phoneDigits = "";
         } else {
@@ -396,7 +400,6 @@ wss.on("connection", (ws) => {
           }
           collectAttempts = 0; return startCollectingWindow(5000);
         }
-
         if (intent.type === "empty") {
           await speakAndContinue("Sorry, I didn’t catch that. What would you like me to do?");
           collectAttempts = 0; return startCollectingWindow(5000);
@@ -453,7 +456,9 @@ wss.on("connection", (ws) => {
   }
 });
 
-// --- Audio & AI helpers ---
+/* ==================
+   Audio & AI helpers
+   ================== */
 function convertMulaw8kToWav16k(mulawBuffer) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -488,7 +493,9 @@ async function transcribeWithWhisper(wavBuffer, opts = {}) {
   return json.text || "";
 }
 
-// ---------- Intents ----------
+/* =======
+   Intents
+   ======= */
 function simpleIntent(userText = "") {
   const t = (userText || "").trim().toLowerCase();
   if (!t) return { type: "empty" };
@@ -544,7 +551,7 @@ Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t c
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model: "gpt-4o-mini", // ✅ keep GPT-4o-mini for latency
       temperature: devMode ? 0.4 : 0.5,
       max_tokens: 140,
       messages
@@ -560,6 +567,9 @@ Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t c
   return text || (devMode ? "Righto — what should we tweak first?" : "Got it. What would you like me to pass on to JP?");
 }
 
+/* ======
+   Server
+   ====== */
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
   if (process.env.OPENAI_API_KEY) {
