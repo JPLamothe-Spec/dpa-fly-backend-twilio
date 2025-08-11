@@ -1,5 +1,10 @@
-// index.js — Duplex with: cached greeting, VAD early-stop (low latency), phone capture OFF,
-// Dev Mode ON by default (assumes JP), project brief injection, British female voice via VALID_VOICES in tts.js
+// index.js — Twilio <Connect><Stream> voice backend with:
+// - MAINTENANCE_MODE kill switch (Reject all calls when true)
+// - Stable greeting, VAD early-stop, barge-in OFF by default
+// - Dev Mode ON (assumes JP), phone capture OFF
+// - Proper cleanup on hangup (endCall)
+// - British female voice via tts.js (validated)
+// - Project brief injection (optional), cache flush endpoint
 
 const express = require("express");
 const http = require("http");
@@ -28,40 +33,45 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ---- Config
+/* ====== Config ====== */
+const MAINTENANCE_MODE = String(process.env.MAINTENANCE_MODE || "false").toLowerCase() === "true";
+
 const GREETING_TEXT =
   process.env.GREETING_TEXT ||
   "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
+
 const TTS_VOICE  = (process.env.TTS_VOICE || "verse").toLowerCase();
 const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts";
+
 const BARGE_IN_ENABLED = String(process.env.BARGE_IN_ENABLED || "false").toLowerCase() === "true";
-const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 22); // for VAD too
+const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 22);
+
 const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 0);
 
-// VAD params (latency killer)
-const VAD_SILENCE_MS = Number(process.env.VAD_SILENCE_MS || 500);    // stop after 0.5s silence
-const VAD_MAX_WINDOW_MS = Number(process.env.VAD_MAX_WINDOW_MS || 2500); // hard cap
+// VAD (latency)
+const VAD_SILENCE_MS = Number(process.env.VAD_SILENCE_MS || 500);   // stop ~0.5s after silence
+const VAD_MAX_WINDOW_MS = Number(process.env.VAD_MAX_WINDOW_MS || 2500); // cap window
 
-const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
+const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 6000); // give TTS time
 const GOODBYE_GUARD_WINDOW_MS = Number(process.env.GOODBYE_GUARD_WINDOW_MS || 2500);
-const GOODBYE_MIN_TOKENS = Number(process.env.GOODBYE_MIN_TOKENS || 4);
+const GOODBYE_MIN_TOKENS      = Number(process.env.GOODBYE_MIN_TOKENS || 4);
 
 const ANNA_DEV_MODE_DEFAULT = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
+
 const PHONE_CAPTURE_ENABLED = String(process.env.PHONE_CAPTURE_ENABLED || "false").toLowerCase() === "true";
+
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
 
-// ---- Project brief (loaded at boot; editable without redeploy)
+/* ====== Project brief (optional) ====== */
 const PROJECT_BRIEF_PATH = process.env.PROJECT_BRIEF_PATH || "./project-brief.md";
 let PROJECT_BRIEF = "";
 try {
   PROJECT_BRIEF = fs.readFileSync(PROJECT_BRIEF_PATH, "utf8");
   console.log(`🧠 Loaded project brief (${PROJECT_BRIEF.length} chars)`);
-} catch {
-  console.log("🧠 No project brief file found; proceeding without it.");
-}
+} catch { console.log("🧠 No project brief file found; proceeding without it."); }
 
-// ---- Helpers
+/* ====== Helpers ====== */
 const AU_MOBILE_LEN = 10;
 const DIGIT_WORDS = { "zero":"0","oh":"0","o":"0","one":"1","two":"2","three":"3","four":"4","five":"5","six":"6","seven":"7","eight":"8","nine":"9" };
 const MULTIPLIER_WORDS = { "double": 2, "triple": 3 };
@@ -72,17 +82,24 @@ function looksLikePhoneIntent(t=""){t=(t||"").toLowerCase();return /\b(my (mobil
 function userCancelsNumberMode(t=""){t=(t||"").toLowerCase();return /\b(not digits|stop digits|cancel number|no number|ignore number|not giving (you )?my number|i'?m not (trying to )?say digits|don'?t take my number)\b/.test(t);}
 function ulawEnergy(buf){let acc=0;for(let i=0;i<buf.length;i++) acc+=Math.abs(buf[i]-0x7f);return acc/buf.length;}
 
-// ---- Twilio webhook
+/* ====== Twilio webhook ====== */
 app.post("/twilio/voice", (req, res) => {
+  if (MAINTENANCE_MODE) {
+    console.log("🚫 MAINTENANCE_MODE active — rejecting call");
+    const twiml = `<Response><Reject/></Response>`;
+    return res.type("text/xml").send(twiml);
+  }
   console.log("➡️ /twilio/voice hit");
   const host = req.headers.host;
   const twiml = `<Response><Connect><Stream url="wss://${host}/media-stream"/></Connect></Response>`;
   res.type("text/xml").send(twiml);
 });
+
+// Health
 app.get("/", (_req,res)=>res.status(200).send("DPA backend is live"));
 app.get("/health", (_req,res)=>res.status(200).send("ok"));
 
-// Admin: flush TTS cache (use after changing TTS_VOICE)
+// Admin: flush TTS cache
 app.post("/admin/flush-tts-cache", (req,res)=>{
   const token = req.headers["x-admin-token"] || "";
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) return res.status(403).json({ok:false,error:"forbidden"});
@@ -92,7 +109,7 @@ app.post("/admin/flush-tts-cache", (req,res)=>{
 
 const server = http.createServer(app);
 
-// ---- WebSocket + session
+/* ====== WebSocket ====== */
 const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade",(request,socket,head)=>{
   if (request.url === "/media-stream") wss.handleUpgrade(request,socket,head,(ws)=>wss.emit("connection",ws,request));
@@ -102,9 +119,12 @@ server.on("upgrade",(request,socket,head)=>{
 wss.on("connection",(ws)=>{
   console.log("✅ Twilio WebSocket connected");
 
+  // ---- state
   let streamSid=null;
   let collecting=false, buffers=[], collectTimer=null, greetingDone=false, collectAttempts=0;
   let ttsController=null, lastSpeechAt=0, vadStartAt=0, vadSilenceSince=null;
+  let vadPoll = null;
+  let callEnded = false;
 
   // Phone capture OFF by default
   let phoneDigits="", expectingPhone=false;
@@ -114,8 +134,22 @@ wss.on("connection",(ws)=>{
   let devKnownName = devModeActive ? DEV_CALLER_NAME : null;
   if (ANNA_DEV_MODE_DEFAULT) console.log("🛠️ Dev mode ENABLED (startup); assuming caller is", DEV_CALLER_NAME);
 
+  function endCall(reason="unknown"){
+    if (callEnded) return;
+    callEnded = true;
+    try { console.log("🛑 Ending call:", reason); } catch {}
+    collecting = false;
+    buffers = [];
+    if (collectTimer) { clearTimeout(collectTimer); collectTimer = null; }
+    if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
+    if (greetingSafetyTimer) { clearTimeout(greetingSafetyTimer); greetingSafetyTimer = null; }
+    try { if (ttsController && !ttsController.cancelled) ttsController.cancel(); } catch {}
+    try { if (ws && ws.readyState === WebSocket.OPEN) ws.close(); } catch {}
+  }
+
   ws.on("message", async (msg)=>{
     let data; try { data = JSON.parse(msg.toString()); } catch { return; }
+    if (callEnded) return;
 
     switch(data.event){
       case "connected":
@@ -130,7 +164,8 @@ wss.on("connection",(ws)=>{
         if (!process.env.OPENAI_API_KEY){
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
           ttsController = new TtsController();
-          startPlaybackTone({ ws, streamSid, logPrefix:"TONE", controller: ttsController }).catch(e=>console.error("TTS/playback error (tone):", e?.message || e));
+          startPlaybackTone({ ws, streamSid, logPrefix:"TONE", controller: ttsController })
+            .catch(e=>console.error("TTS/playback error (tone):", e?.message || e));
         } else {
           console.log("🔊 Playback mode: OpenAI TTS (cached)");
           ttsController = new TtsController();
@@ -139,58 +174,63 @@ wss.on("connection",(ws)=>{
         }
 
         greetingDone=false; collecting=false; stopCollecting();
-        setTimeout(()=>{
-          if (!greetingDone){
-            console.log("⏱️ Greeting safety timeout — starting listen (barge-in disabled)");
+        greetingSafetyTimer = setTimeout(()=>{
+          if (!greetingDone && !callEnded){
+            console.log("⏱️ Greeting safety timeout — starting listen");
             greetingDone=true; startCollectingVAD();
           }
         }, GREETING_SAFETY_MS);
         break;
 
       case "media": {
+        if (callEnded) break;
         const b64 = data?.media?.payload;
         if (!b64) break;
         const chunk = Buffer.from(b64,"base64");
-        // VAD tracking (always on; independent of barge-in)
+        // VAD tracking
         const e = ulawEnergy(chunk);
         if (e > SPEECH_THRESH) { lastSpeechAt = Date.now(); vadSilenceSince = null; }
         else { if (!vadSilenceSince) vadSilenceSince = Date.now(); }
-
         if (collecting) buffers.push(chunk);
         break;
       }
 
       case "mark":
         console.log("📍 Twilio mark:", data?.mark?.name);
-        if ((data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") && !greetingDone){
+        if ((data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") && !greetingDone && !callEnded) {
           greetingDone = true;
           startCollectingVAD();
         }
         break;
 
       case "stop":
-        console.log("🛑 Twilio signaled stop — closing stream");
-        try { ws.close(); } catch {}
+        endCall("twilio stop event");
         break;
     }
   });
 
-  ws.on("close", ()=>{ stopCollecting(); console.log("❌ WebSocket closed"); });
-  ws.on("error", err=>{ console.error("⚠️ WebSocket error:", err?.message || err); try{ws.close();}catch{} });
+  ws.on("close", () => { endCall("ws close"); console.log("❌ WebSocket closed"); });
+  ws.on("error", (err) => { console.error("⚠️ WebSocket error:", err?.message || err); endCall("ws error"); });
 
-  // ===== VAD-driven collection (end early on ~500ms silence, cap at 2.5s) =====
+  /* ===== VAD-driven collection ===== */
+  let greetingSafetyTimer = null;
+
   function startCollectingVAD(){
+    if (callEnded) return;
     stopCollecting();
     collecting = true; buffers = []; collectAttempts += 1;
     vadStartAt = Date.now(); vadSilenceSince = null; lastSpeechAt = Date.now();
 
-    // Poll for silence end
-    const poll = setInterval(async ()=>{
+    if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
+    vadPoll = setInterval(async ()=>{
+      if (callEnded || !ws || ws.readyState !== WebSocket.OPEN) {
+        clearInterval(vadPoll); vadPoll = null; return;
+      }
       const now = Date.now();
       const hitSilence = vadSilenceSince && (now - vadSilenceSince) >= VAD_SILENCE_MS;
-      const hitMax = (now - vadStartAt) >= VAD_MAX_WINDOW_MS;
+      const hitMax     = (now - vadStartAt) >= VAD_MAX_WINDOW_MS;
       if (hitSilence || hitMax){
-        clearInterval(poll);
+        clearInterval(vadPoll); vadPoll = null;
         collecting = false;
         const mulaw = Buffer.concat(buffers); buffers = [];
         await processTurn(mulaw);
@@ -199,6 +239,7 @@ wss.on("connection",(ws)=>{
   }
 
   async function processTurn(mulaw){
+    if (callEnded) return;
     const isLikelySilence = mulaw.length < (160 * 6); // ~120ms
     if (isLikelySilence && collectAttempts < 3) {
       console.log("🤫 Low audio captured — retry listen");
@@ -228,14 +269,14 @@ wss.on("connection",(ws)=>{
 
       // Intents
       const intent = simpleIntent(transcript);
-      if (intent.type === "dev_on"){ console.log("🛠️ Dev mode ENABLED (voice)"); devModeActive=true; devKnownName=DEV_CALLER_NAME; await speakAndContinue(`Dev mode on. Hey ${devKnownName}, ready to iterate.`); collectAttempts=0; return startCollectingVAD(); }
-      if (intent.type === "dev_off"){ console.log("🛠️ Dev mode DISABLED (voice)"); devModeActive=false; devKnownName=null; await speakAndContinue("Dev mode off. Keeping it simple."); collectAttempts=0; return startCollectingVAD(); }
+      if (intent.type === "dev_on"){ devModeActive=true; devKnownName=DEV_CALLER_NAME; await speakAndContinue(`Dev mode on. Hey ${devKnownName}, ready to iterate.`); collectAttempts=0; return startCollectingVAD(); }
+      if (intent.type === "dev_off"){ devModeActive=false; devKnownName=null; await speakAndContinue("Dev mode off. Keeping it simple."); collectAttempts=0; return startCollectingVAD(); }
       if (intent.type === "decline"){ await speakAndContinue(devModeActive?`All good, ${DEV_CALLER_NAME}. What should we test next?`:"No worries. I can help another time."); collectAttempts=0; return startCollectingVAD(); }
       if (intent.type === "empty"){ await speakAndContinue("Sorry, I didn’t catch that. How can I help?"); collectAttempts=0; return startCollectingVAD(); }
       if (intent.type === "check_audio"){ await speakAndContinue("Yep, I can hear you."); collectAttempts=0; return startCollectingVAD(); }
-      if (intent.type === "goodbye"){ await speakAndContinue("Bye for now!"); return; }
+      if (intent.type === "goodbye"){ await speakAndContinue("Bye for now!"); endCall("caller said goodbye"); return; }
 
-      // Normal GPT path (concise + brief injected project context in dev mode)
+      // Normal GPT path (concise + project brief in dev)
       const reply = await generateReply({ userText: transcript, devMode: devModeActive, knownName: devKnownName, projectBrief: PROJECT_BRIEF });
       console.log("🤖 GPT reply:", reply);
 
@@ -243,15 +284,21 @@ wss.on("connection",(ws)=>{
       collectAttempts = 0;
       startCollectingVAD();
     } catch(e){
-      console.error("❌ ASR/Reply error:", e?.message || e);
+      if (!callEnded) console.error("❌ ASR/Reply error:", e?.message || e);
       collectAttempts = 0;
-      startCollectingVAD();
+      if (!callEnded) startCollectingVAD();
     }
   }
 
-  function stopCollecting(){ collecting=false; buffers=[]; if (collectTimer){ clearTimeout(collectTimer); collectTimer=null; } }
+  function stopCollecting() {
+    collecting = false;
+    buffers = [];
+    if (collectTimer) { clearTimeout(collectTimer); collectTimer = null; }
+    if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
+  }
 
   async function speakAndContinue(text){
+    if (callEnded || !ws || ws.readyState !== WebSocket.OPEN) return;
     const now = Date.now();
     const waitMs = Math.max(0, SILENCE_BEFORE_REPLY_MS - (now - lastSpeechAt));
     if (waitMs > 0) await new Promise(r=>setTimeout(r, waitMs));
@@ -260,7 +307,7 @@ wss.on("connection",(ws)=>{
   }
 });
 
-// --- Audio & AI helpers
+/* ====== Audio & AI helpers ====== */
 function convertMulaw8kToWav16k(mulawBuffer) {
   return new Promise((resolve, reject) => {
     const args = ["-f","mulaw","-ar","8000","-ac","1","-i","pipe:0","-ar","16000","-ac","1","-f","wav","pipe:1"];
@@ -292,7 +339,7 @@ async function transcribeWithWhisper(wavBuffer, opts = {}) {
   return json.text || "";
 }
 
-// Intents
+/* ====== Intents ====== */
 function simpleIntent(userText=""){
   const t = (userText||"").trim().toLowerCase();
   if (!t) return { type: "empty" };
@@ -310,14 +357,10 @@ async function generateReply({ userText, devMode, knownName, projectBrief }) {
   if (!process.env.OPENAI_API_KEY) return "Sorry, I didn’t catch that.";
   const brief = projectBrief ? `\n\nPROJECT BRIEF (for dev mode):\n${projectBrief}\n` : "";
   const system = devMode
-    ? (
-      `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
+    ? (`You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
 Caller is ${knownName || "JP"} (developer) on a live PHONE CALL. Be very concise (≤ 12 words).
-Surface helpful diagnostics only when useful. Avoid numbers unless explicitly asked.${brief}`
-    )
-    : (
-      "You are Anna, JP’s digital personal assistant on a live phone call. Primary task: take a short message, confirm name and callback number (04xx xxx xxx). Be concise and natural. Avoid 'I can’t hear you'."
-    );
+Surface helpful diagnostics only when useful. Avoid numbers unless explicitly asked.${brief}`)
+    : ("You are Anna, JP’s digital personal assistant on a live phone call. Primary task: take a short message, confirm name and callback number (04xx xxx xxx). Be concise and natural. Avoid 'I can’t hear you'.");
 
   const messages = [
     { role: "system", content: system },
@@ -336,7 +379,7 @@ Surface helpful diagnostics only when useful. Avoid numbers unless explicitly as
   return text || (devMode ? "Ready. What should we tweak first?" : "Got it. What would you like me to pass on?");
 }
 
-// Server
+/* ====== Server ====== */
 server.listen(PORT,"0.0.0.0", async ()=>{
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
   if (process.env.OPENAI_API_KEY) {
