@@ -3,7 +3,9 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-const DEFAULT_VOICE = process.env.TTS_VOICE || "aria";            // British female by default
+const VALID_VOICES = new Set(["alloy","ash","ballad","coral","echo","fable","nova","onyx","sage","shimmer","verse"]);
+const envVoice = (process.env.TTS_VOICE || "verse").toLowerCase();
+const DEFAULT_VOICE = VALID_VOICES.has(envVoice) ? envVoice : "verse"; // fall back safely
 const DEFAULT_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
 console.log(`🎙️ TTS voice=${DEFAULT_VOICE} model=${DEFAULT_MODEL}`);
@@ -17,6 +19,7 @@ class TtsController {
 
 /** OpenAI TTS -> WAV (PCM16 @ 8kHz) */
 async function synthesizeWav({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODEL }) {
+  if (!VALID_VOICES.has(voice)) voice = DEFAULT_VOICE; // guard at runtime too
   const r = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, "Content-Type": "application/json" },
@@ -29,25 +32,13 @@ async function synthesizeWav({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODE
 /** ffmpeg: WAV (PCM16@8k) -> RAW μ-law (PCMU@8k) */
 function wavToMulawRaw(wavBuf) {
   return new Promise((resolve, reject) => {
-    const args = [
-      "-hide_banner", "-loglevel", "error",
-      "-i", "pipe:0",
-      "-vn",
-      "-acodec", "pcm_mulaw",
-      "-f", "mulaw",
-      "-ar", "8000",
-      "-ac", "1",
-      "pipe:1"
-    ];
+    const args = ["-hide_banner","-loglevel","error","-i","pipe:0","-vn","-acodec","pcm_mulaw","-f","mulaw","-ar","8000","-ac","1","pipe:1"];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
     let errTxt = "";
     p.stdout.on("data", (b) => chunks.push(b));
     p.stderr.on("data", (b) => { errTxt += b.toString(); });
-    p.on("close", (code) => {
-      if (code === 0) return resolve(Buffer.concat(chunks));
-      reject(new Error(`ffmpeg (wav->mulaw) exited ${code}: ${errTxt.trim()}`));
-    });
+    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (wav->mulaw) exited ${code}: ${errTxt.trim()}`)));
     p.on("error", (e) => reject(e));
     p.stdin.end(wavBuf);
   });
@@ -101,7 +92,7 @@ function clearGreetingCache() {
   console.log("🧹 TTS greeting cache cleared");
 }
 
-// Minimal fallback “tone” (neutral buffer) if no API key set
+// Minimal fallback (neutral buffer) if no API key set
 async function startPlaybackTone({ ws, streamSid, controller, logPrefix = "TONE" }) {
   const silence = Buffer.alloc(8000 / 2);
   await playMulawBuffer({ ws, streamSid, buffer: silence, controller, logPrefix });
