@@ -6,6 +6,8 @@ const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...ar
 const DEFAULT_VOICE = process.env.TTS_VOICE || "verse";          // British female by default
 const DEFAULT_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
+console.log(`🎙️ TTS voice=${DEFAULT_VOICE} model=${DEFAULT_MODEL}`);
+
 const greetingCache = new Map();
 
 class TtsController {
@@ -24,12 +26,7 @@ async function synthesizeWav({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODE
   return Buffer.from(await r.arrayBuffer());
 }
 
-/** ffmpeg: WAV (PCM16@8k) -> RAW μ-law (PCMU@8k)
- *  NOTES:
- *  - Do NOT force "-f wav" on input; let ffmpeg auto-detect header.
- *  - Explicitly set codec to pcm_mulaw and format to raw mulaw.
- *  - Bubble up stderr for debugging if it fails.
- */
+/** ffmpeg: WAV (PCM16@8k) -> RAW μ-law (PCMU@8k) */
 function wavToMulawRaw(wavBuf) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -99,6 +96,7 @@ async function warmGreeting({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODEL
   }
 }
 
+// Minimal fallback “tone” (neutral buffer) if no API key set
 async function startPlaybackTone({ ws, streamSid, controller, logPrefix = "TONE" }) {
   const silence = Buffer.alloc(8000 / 2);
   await playMulawBuffer({ ws, streamSid, buffer: silence, controller, logPrefix });
