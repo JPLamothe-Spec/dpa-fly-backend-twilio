@@ -1,5 +1,5 @@
-// index.js — Stable duplex: cached greeting, protected from early barge-in,
-// Whisper ASR → GPT → TTS replies, with optional barge-in (off by default)
+// index.js — Stable duplex: cached greeting (no early cancel), optional barge-in (OFF by default),
+// Whisper ASR → GPT (with hybrid intent for short phrases) → TTS replies
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -33,21 +33,21 @@ const GREETING_TEXT =
 const TTS_VOICE  = process.env.TTS_VOICE  || "alloy";
 const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts";
 
-// Barge-in defaults OFF for stability; you can enable via secret later
+// Barge-in defaults OFF for stability; enable later via secret if desired
 const BARGE_IN_ENABLED =
   String(process.env.BARGE_IN_ENABLED || "false").toLowerCase() === "true";
 const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 22); // conservative
 const HOT_FRAMES    = Number(process.env.BARGE_IN_FRAMES || 8);  // ~160ms at 20ms frames
 const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 500);
 
-// Greeting safety: if Twilio never echoes mark, we still start listening
+// Greeting safety: if Twilio never echoes mark, we still start listening (but don't cancel greeting)
 const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
 
-// Goodbye guard: ignore super-short "bye" right after greeting (noise/accidental)
+// Goodbye guard: ignore tiny “bye” right after greeting (accidental)
 const GOODBYE_GUARD_WINDOW_MS = Number(process.env.GOODBYE_GUARD_WINDOW_MS || 2500);
 const GOODBYE_MIN_TOKENS      = Number(process.env.GOODBYE_MIN_TOKENS || 4);
 
-// ---------- μ-law energy helper (kept for optional barge-in)
+// ---------- μ-law energy helper (for optional barge-in)
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
@@ -313,14 +313,58 @@ async function transcribeWithWhisper(wavBuffer) {
   return json.text || "";
 }
 
+// ---------- Hybrid intent + GPT ----------
+function simpleIntent(userText = "") {
+  const t = (userText || "").trim().toLowerCase();
+
+  if (!t) return { type: "empty" };
+
+  // explicit goodbyes
+  if (/\b(bye|goodbye|see you|catch you|talk later)\b/.test(t)) {
+    return { type: "goodbye" };
+  }
+
+  // user checking audio
+  if (/\b(can you hear me|are you there|hello)\b/.test(t)) {
+    return { type: "check_audio" };
+  }
+
+  // short affirmations
+  if (/^(yes|yeah|yep|sure|please|ok|okay|that would be great|i would|i do)\b/.test(t) && t.split(/\s+/).length <= 6) {
+    return { type: "affirm" };
+  }
+
+  return { type: "freeform" };
+}
+
 async function generateReply(userText) {
   if (!process.env.OPENAI_API_KEY) return "Sorry, I didn’t catch that.";
-  // Voice-safe system prompt (no “I can’t hear you” phrasing)
+
+  const intent = simpleIntent(userText);
+
+  // Lightweight rules for ultra-short/common phrases (no GPT call)
+  if (intent.type === "empty") {
+    return "Sorry, I didn’t catch that. What message would you like me to pass on to JP?";
+  }
+  if (intent.type === "check_audio") {
+    return "Yes, I can hear you. What would you like me to pass on to JP?";
+  }
+  if (intent.type === "affirm") {
+    return "Great — what would you like me to pass on to JP?";
+  }
+  if (intent.type === "goodbye") {
+    return "No worries — I’ll be here if you need me. Bye for now!";
+  }
+
+  // For normal sentences, give GPT clear context of the call
   const system =
-    "You are Anna, JP's friendly Australian digital personal assistant on a live phone call. " +
-    "You DO hear the caller via live transcription. " +
-    "Be concise, natural, and helpful. Avoid saying 'I can’t hear you'—instead say 'Sorry, I didn’t catch that' if needed. " +
-    "Do not end the call or say goodbye unless the user clearly asks to end.";
+    "You are Anna, JP’s Australian digital personal assistant on a live phone call. " +
+    "Your primary task is to take a short message for JP and confirm any details needed. " +
+    "Be proactive and specific. If the caller sounds affirmative but vague, ask: " +
+    "‘What would you like me to pass on to JP?’ " +
+    "Avoid saying ‘I can’t hear you.’ Use ‘Sorry, I didn’t catch that’ only when the transcript is empty. " +
+    "Keep replies concise and natural.";
+
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -333,14 +377,19 @@ async function generateReply(userText) {
       max_tokens: 120,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: userText || "The caller said nothing." }
+        { role: "assistant", content: "Hi, this is Anna, JP’s digital personal assistant. Would you like me to pass on a message?" },
+        { role: "user", content: userText }
       ],
     }),
   });
-  if (!resp.ok) throw new Error(`Chat failed: ${resp.status} ${await resp.text().catch(() => "")}`);
+
+  if (!resp.ok) {
+    const errTxt = await resp.text().catch(() => "");
+    throw new Error(`Chat failed: ${resp.status} ${errTxt}`);
+  }
   const json = await resp.json();
-  const text = json.choices?.[0]?.message?.content?.trim() || "Okay.";
-  return text;
+  const text = json.choices?.[0]?.message?.content?.trim();
+  return text || "Got it. What would you like me to pass on to JP?";
 }
 
 server.listen(PORT, "0.0.0.0", async () => {
