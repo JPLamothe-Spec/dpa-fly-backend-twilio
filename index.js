@@ -34,7 +34,7 @@ const TTS_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
-  return acc / buf.length; // 0..~128 (rough)
+  return acc / buf.length; // ~0..128
 }
 const SPEECH_THRESH = 12;             // tweak if needed
 const SILENCE_BEFORE_REPLY_MS = 400;  // wait this long of quiet before speaking
@@ -58,8 +58,9 @@ app.get("/", (_req, res) => res.status(200).send("DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ noServer: true });
 
+// ---- Single WebSocket server (noServer=true) + single upgrade handler (fixes double-upgrade crash)
+const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (request, socket, head) => {
   if (request.url === "/media-stream") {
     wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
@@ -174,7 +175,7 @@ wss.on("connection", (ws) => {
       buffers = [];
 
       // If we captured almost nothing, retry once with a longer window
-      const isLikelySilence = mulaw.length < (FRAME_BYTES * 10); // ~200ms of audio
+      const isLikelySilence = mulaw.length < (160 * 10); // ~200ms of audio at 8k μ-law
       if (isLikelySilence && collectAttempts < 2) {
         console.log("🤫 Low audio captured — extending collection window");
         return startCollectingWindow(5000);
@@ -272,14 +273,6 @@ async function generateReply(userText) {
   const json = await resp.json();
   return json.choices?.[0]?.message?.content?.trim() || "Okay.";
 }
-
-server.on("upgrade", (request, socket, head) => {
-  if (request.url === "/media-stream") {
-    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
-  } else {
-    socket.destroy();
-  }
-});
 
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
