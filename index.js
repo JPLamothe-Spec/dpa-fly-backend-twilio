@@ -1,5 +1,6 @@
 // index.js — Stable duplex: cached greeting (no early cancel), optional barge-in (OFF by default),
-// Whisper ASR → GPT (with hybrid intent for short phrases) → TTS replies
+// Whisper ASR → GPT (with hybrid intent + AU phone capture) → TTS replies,
+// Dev Mode that can be toggled by voice: “dev mode on/off”
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -47,11 +48,73 @@ const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
 const GOODBYE_GUARD_WINDOW_MS = Number(process.env.GOODBYE_GUARD_WINDOW_MS || 2500);
 const GOODBYE_MIN_TOKENS      = Number(process.env.GOODBYE_MIN_TOKENS || 4);
 
+// Dev Mode default from env; per-call voice toggle can override
+const ANNA_DEV_MODE_DEFAULT =
+  String(process.env.ANNA_DEV_MODE || "false").toLowerCase() === "true";
+
 // ---------- μ-law energy helper (for optional barge-in)
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
   return acc / buf.length; // rough 0..128
+}
+
+// ---- Phone capture helpers (AU-focused) ----
+const AU_MOBILE_LEN = 10;
+const DIGIT_WORDS = {
+  "zero": "0", "oh": "0", "o": "0",
+  "one": "1", "won": "1",
+  "two": "2", "to": "2", "too": "2",
+  "three": "3", "tree": "3",
+  "four": "4", "for": "4",
+  "five": "5",
+  "six": "6",
+  "seven": "7",
+  "eight": "8", "ate": "8",
+  "nine": "9"
+};
+const MULTIPLIER_WORDS = { "double": 2, "triple": 3 };
+
+function tokensFrom(text) {
+  return (text || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+// Extract digits from a text turn, supporting words + inline numbers + "double/triple X"
+function extractDigitsFromTranscript(text) {
+  const out = [];
+  const toks = tokensFrom(text);
+
+  // Also capture any contiguous numeric strings quickly
+  const inline = (text || "").match(/\d+/g);
+  if (inline) inline.forEach(s => out.push(...s.split("")));
+
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+
+    if (MULTIPLIER_WORDS[t] && i + 1 < toks.length) {
+      const next = DIGIT_WORDS[toks[i + 1]];
+      if (next != null) {
+        out.push(...Array(MULTIPLIER_WORDS[t]).fill(next));
+        i++; // skip next
+        continue;
+      }
+    }
+    const d = DIGIT_WORDS[t];
+    if (d != null) { out.push(d); continue; }
+  }
+  return out.join("");
+}
+
+// Format 04xxxxxxxx as 04xx xxx xxx (AU mobile)
+function formatAuMobile(digits) {
+  const d = digits.slice(0, AU_MOBILE_LEN);
+  if (d.length < 4) return d;
+  if (d.length <= 7) return `${d.slice(0,4)} ${d.slice(4)}`;
+  return `${d.slice(0,4)} ${d.slice(4,7)} ${d.slice(7)}`;
 }
 
 // --- Twilio webhook: open full-duplex media stream using <Connect><Stream>
@@ -103,6 +166,13 @@ wss.on("connection", (ws) => {
   let speechHotCount = 0;
   let greetingSafetyTimer = null;
   let firstListenStartedAt = 0;
+
+  // Phone capture state
+  let phoneDigits = "";           // accumulates across turns
+  let expectingPhone = false;     // set true when we ask for a number
+
+  // Per-call Dev Mode flag; can be toggled by voice
+  let devModeActive = ANNA_DEV_MODE_DEFAULT;
 
   ws.on("message", async (msg) => {
     let data;
@@ -208,7 +278,7 @@ wss.on("connection", (ws) => {
     try { ws.close(); } catch {}
   });
 
-  // ----- Collect → ASR → GPT → TTS reply -----
+  // ----- Collect → ASR → (hybrid intent/phone/dev toggles) → GPT → TTS reply -----
   function startCollectingWindow(ms) {
     stopCollecting(); // reset
     collecting = true;
@@ -246,20 +316,76 @@ wss.on("connection", (ws) => {
           return startCollectingWindow(5000);
         }
 
-        const reply = await generateReply(transcript);
+        // === Phone capture branch (runs before GPT) ===
+        let handledByPhoneFlow = false;
+        const newlyHeard = extractDigitsFromTranscript(transcript);
+        if (newlyHeard) {
+          // If caller started giving a number, enter phone capture mode
+          expectingPhone = true;
+          phoneDigits += newlyHeard;
+          // Trim to max length
+          if (phoneDigits.length > AU_MOBILE_LEN) phoneDigits = phoneDigits.slice(0, AU_MOBILE_LEN);
+        }
+
+        if (expectingPhone) {
+          if (phoneDigits.length === 0) {
+            await speakAndContinue("What’s the best number for JP to call you back on? Please say it digit by digit.");
+            handledByPhoneFlow = true;
+          } else if (phoneDigits.length < AU_MOBILE_LEN) {
+            const remaining = AU_MOBILE_LEN - phoneDigits.length;
+            await speakAndContinue(`I have ${formatAuMobile(phoneDigits)}. Please say the next ${remaining} digit${remaining===1?"":"s"}, one at a time.`);
+            handledByPhoneFlow = true;
+          } else {
+            // We have 10 digits — confirm
+            const pretty = formatAuMobile(phoneDigits);
+            await speakAndContinue(`Just to confirm, is your number ${pretty}?`);
+            handledByPhoneFlow = true;
+            // Stay in expectingPhone=true; next user turn should confirm yes/no
+          }
+        }
+
+        if (handledByPhoneFlow) {
+          // Open another listen window and return early
+          collectAttempts = 0;
+          return startCollectingWindow(5000);
+        }
+
+        // === Hybrid intent for short phrases & dev mode toggles (before GPT) ===
+        const intent = simpleIntent(transcript);
+
+        if (intent.type === "dev_on") {
+          devModeActive = true;
+          await speakAndContinue("Dev mode enabled. I’ll share brief diagnostics as we test.");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+        if (intent.type === "dev_off") {
+          devModeActive = false;
+          await speakAndContinue("Dev mode disabled. I’ll keep it simple for callers.");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+
+        if (intent.type === "empty") {
+          await speakAndContinue("Sorry, I didn’t catch that. What message would you like me to pass on to JP?");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+        if (intent.type === "check_audio") {
+          await speakAndContinue("Yes, I can hear you. What would you like me to pass on to JP?");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+        if (intent.type === "affirm") {
+          await speakAndContinue("Great — what would you like me to pass on to JP?");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+        if (intent.type === "goodbye") {
+          await speakAndContinue("No worries — I’ll be here if you need me. Bye for now!");
+          collectAttempts = 0; return; // likely caller will hang up
+        }
+
+        // === Normal GPT path ===
+        const reply = await generateReply(transcript, devModeActive);
         console.log("🤖 GPT reply:", reply);
 
-        // Wait for a brief quiet period before replying (helps not to jump in)
-        const now = Date.now();
-        const waitMs = Math.max(0, SILENCE_BEFORE_REPLY_MS - (now - lastSpeechAt));
-        if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
-
-        ttsController = new TtsController();
-        await startPlaybackFromTTS({
-          ws, streamSid, text: reply,
-          voice: TTS_VOICE, model: TTS_MODEL,
-          controller: ttsController
-        });
+        await speakAndContinue(reply);
 
         // Keep the convo going with a new window
         collectAttempts = 0;
@@ -277,6 +403,20 @@ wss.on("connection", (ws) => {
     collecting = false;
     buffers = [];
     if (collectTimer) { clearTimeout(collectTimer); collectTimer = null; }
+  }
+
+  async function speakAndContinue(text) {
+    // brief quiet period before speaking
+    const now = Date.now();
+    const waitMs = Math.max(0, SILENCE_BEFORE_REPLY_MS - (now - lastSpeechAt));
+    if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
+    ttsController = new TtsController();
+    await startPlaybackFromTTS({
+      ws, streamSid, text,
+      voice: TTS_VOICE, model: TTS_MODEL,
+      controller: ttsController
+    });
   }
 });
 
@@ -334,36 +474,42 @@ function simpleIntent(userText = "") {
     return { type: "affirm" };
   }
 
+  // dev mode toggles (voice)
+  if (/\b(dev mode on|developer mode on)\b/i.test(t)) return { type: "dev_on" };
+  if (/\b(dev mode off|developer mode off)\b/i.test(t)) return { type: "dev_off" };
+
   return { type: "freeform" };
 }
 
-async function generateReply(userText) {
+async function generateReply(userText, devMode) {
   if (!process.env.OPENAI_API_KEY) return "Sorry, I didn’t catch that.";
 
-  const intent = simpleIntent(userText);
+  // Voice-safe + dual-mode system prompt
+  const system = devMode
+    ? (
+      "You are Anna, JP’s Australian digital personal assistant AND a core member of the DPA build team. " +
+      "Context: You are on a live PHONE CALL fed by ASR transcripts. Keep replies natural and concise for callers. " +
+      "When speaking with JP (a developer) or when the user asks about performance, ALSO provide brief engineering insights " +
+      "inline and helpful next steps. Use plain English, no jargon unless asked. " +
+      "Diagnostics you may surface succinctly when relevant: 'greeting played fully?', 'any barge-in?', 'ASR captured digits?', " +
+      "'latency since last speech (approx)?', 'did we hit safety timeout?', 'suggested thresholds or prompts'. " +
+      "NEVER say 'I can’t hear you'; instead use 'Sorry, I didn’t catch that' only when the transcript is empty. " +
+      "Primary task for normal callers: take a short message for JP, confirm name and callback number, and read back numbers in 04xx xxx xxx format."
+    )
+    : (
+      "You are Anna, JP’s Australian digital personal assistant on a live phone call. " +
+      "Your primary task is to take a short message for JP, confirm the caller’s name and callback number, " +
+      "read back numbers in 04xx xxx xxx format, and be concise and natural. " +
+      "Avoid saying 'I can’t hear you'; only say 'Sorry, I didn’t catch that' if the transcript is empty. " +
+      "Do not end the call or say goodbye unless the caller clearly asks to end."
+    );
 
-  // Lightweight rules for ultra-short/common phrases (no GPT call)
-  if (intent.type === "empty") {
-    return "Sorry, I didn’t catch that. What message would you like me to pass on to JP?";
-  }
-  if (intent.type === "check_audio") {
-    return "Yes, I can hear you. What would you like me to pass on to JP?";
-  }
-  if (intent.type === "affirm") {
-    return "Great — what would you like me to pass on to JP?";
-  }
-  if (intent.type === "goodbye") {
-    return "No worries — I’ll be here if you need me. Bye for now!";
-  }
-
-  // For normal sentences, give GPT clear context of the call
-  const system =
-    "You are Anna, JP’s Australian digital personal assistant on a live phone call. " +
-    "Your primary task is to take a short message for JP and confirm any details needed. " +
-    "Be proactive and specific. If the caller sounds affirmative but vague, ask: " +
-    "‘What would you like me to pass on to JP?’ " +
-    "Avoid saying ‘I can’t hear you.’ Use ‘Sorry, I didn’t catch that’ only when the transcript is empty. " +
-    "Keep replies concise and natural.";
+  // Seed minimal context so the model knows the call setup
+  const messages = [
+    { role: "system", content: system },
+    { role: "assistant", content: "Hi, this is Anna, JP’s digital personal assistant. Would you like me to pass on a message?" },
+    { role: "user", content: userText || "" }
+  ];
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -373,13 +519,9 @@ async function generateReply(userText) {
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0.5,
-      max_tokens: 120,
-      messages: [
-        { role: "system", content: system },
-        { role: "assistant", content: "Hi, this is Anna, JP’s digital personal assistant. Would you like me to pass on a message?" },
-        { role: "user", content: userText }
-      ],
+      temperature: devMode ? 0.4 : 0.5,
+      max_tokens: 140,
+      messages
     }),
   });
 
