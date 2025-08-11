@@ -1,4 +1,4 @@
-// index.js — Full duplex + 1-turn ASR (Whisper) -> GPT -> TTS reply, with FAST cached greeting
+// index.js — Full duplex with cached fast greeting + barge-in + 1-turn ASR (Whisper) -> GPT -> TTS reply
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -8,7 +8,7 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// Native-friendly fetch shim (node-fetch v3 in CJS)
+// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3 in CJS)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const {
@@ -16,6 +16,7 @@ const {
   startPlaybackTone,
   warmGreeting,
   playCachedGreeting,
+  TtsController,
 } = require("./tts");
 
 const app = express();
@@ -28,6 +29,15 @@ const GREETING_TEXT =
   "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
 const TTS_VOICE = process.env.TTS_VOICE || "alloy";
 const TTS_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
+
+// ---------- Simple μ-law energy (for barge-in) ----------
+function ulawEnergy(buf) {
+  let acc = 0;
+  for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
+  return acc / buf.length; // 0..~128 (rough)
+}
+const SPEECH_THRESH = 12;             // tweak if needed
+const SILENCE_BEFORE_REPLY_MS = 400;  // wait this long of quiet before speaking
 
 // --- Twilio webhook: open full-duplex media stream
 app.post("/twilio/voice", (req, res) => {
@@ -63,12 +73,14 @@ wss.on("connection", (ws) => {
 
   let streamSid = null;
 
-  // collection state
+  // Conversation state
   let collecting = false;
   let buffers = [];
   let collectTimer = null;
   let greetingDone = false;
   let collectAttempts = 0;
+  let ttsController = null;
+  let lastSpeechAt = 0;
 
   ws.on("message", async (msg) => {
     let data;
@@ -83,29 +95,43 @@ wss.on("connection", (ws) => {
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
+        // Greeting
         if (!process.env.OPENAI_API_KEY) {
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
-          startPlaybackTone({ ws, streamSid, logPrefix: "TONE" })
+          ttsController = new TtsController();
+          startPlaybackTone({ ws, streamSid, logPrefix: "TONE", controller: ttsController })
             .catch((e) => console.error("TTS/playback error (tone):", e?.message || e));
         } else {
           console.log("🔊 Playback mode: OpenAI TTS (cached)");
-          // Play cached greeting immediately; fallback to live TTS if not warmed yet
+          ttsController = new TtsController();
           playCachedGreeting({
-            ws,
-            streamSid,
+            ws, streamSid,
             text: GREETING_TEXT,
             voice: TTS_VOICE,
             model: TTS_MODEL,
+            controller: ttsController,
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
 
-        // IMPORTANT: wait for greeting mark before starting the 1st collect window
-        stopCollecting(); // ensure clean slate
+        // Do NOT collect until greeting finishes
+        stopCollecting();
         break;
 
       case "media":
-        if (collecting && data?.media?.payload) {
-          buffers.push(Buffer.from(data.media.payload, "base64"));
+        if (data?.media?.payload) {
+          const chunk = Buffer.from(data.media.payload, "base64");
+
+          // Barge-in: if caller is speaking, cancel any active TTS immediately
+          const e = ulawEnergy(chunk);
+          if (e > SPEECH_THRESH) {
+            lastSpeechAt = Date.now();
+            if (ttsController && !ttsController.cancelled) {
+              ttsController.cancel();
+              console.log("🔇 Barge-in: caller speech detected — cancelling TTS");
+            }
+          }
+
+          if (collecting) buffers.push(chunk);
         }
         break;
 
@@ -113,7 +139,7 @@ wss.on("connection", (ws) => {
         console.log("📍 Twilio mark:", data?.mark?.name);
         if ((data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") && !greetingDone) {
           greetingDone = true;
-          // Start a fresh 4s collection NOW that the greeting finished
+          // Start first collection window AFTER greeting is confirmed finished
           startCollectingWindow(4000);
         }
         break;
@@ -135,8 +161,9 @@ wss.on("connection", (ws) => {
     try { ws.close(); } catch {}
   });
 
+  // ----- Collect → ASR → GPT → TTS reply -----
   function startCollectingWindow(ms) {
-    stopCollecting(); // reset any previous window
+    stopCollecting(); // reset
     collecting = true;
     buffers = [];
     collectAttempts += 1;
@@ -146,8 +173,8 @@ wss.on("connection", (ws) => {
       const mulaw = Buffer.concat(buffers);
       buffers = [];
 
-      // If near-empty or likely silence, one retry with a longer window
-      const isLikelySilence = mulaw.length < 160 * 10; // < ~200ms of audio
+      // If we captured almost nothing, retry once with a longer window
+      const isLikelySilence = mulaw.length < (FRAME_BYTES * 10); // ~200ms of audio
       if (isLikelySilence && collectAttempts < 2) {
         console.log("🤫 Low audio captured — extending collection window");
         return startCollectingWindow(5000);
@@ -161,13 +188,19 @@ wss.on("connection", (ws) => {
         const reply = await generateReply(transcript);
         console.log("🤖 GPT reply:", reply);
 
+        // Wait for a brief quiet period before replying
+        const now = Date.now();
+        const waitMs = Math.max(0, SILENCE_BEFORE_REPLY_MS - (now - lastSpeechAt));
+        if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
+        ttsController = new TtsController();
         await startPlaybackFromTTS({
           ws, streamSid, text: reply,
-          voice: TTS_VOICE,
-          model: TTS_MODEL,
+          voice: TTS_VOICE, model: TTS_MODEL,
+          controller: ttsController
         });
 
-        // (Optional) queue another collection window for a second turn
+        // Keep the convo going with a new window
         collectAttempts = 0;
         startCollectingWindow(5000);
       } catch (e) {
@@ -179,32 +212,22 @@ wss.on("connection", (ws) => {
   function stopCollecting() {
     collecting = false;
     buffers = [];
-    if (collectTimer) {
-      clearTimeout(collectTimer);
-      collectTimer = null;
-    }
+    if (collectTimer) { clearTimeout(collectTimer); collectTimer = null; }
   }
 });
 
-// --- Helpers: audio convert + Whisper + GPT
+// --- Audio & AI helpers ---
 function convertMulaw8kToWav16k(mulawBuffer) {
   return new Promise((resolve, reject) => {
     const args = [
-      "-f", "mulaw",
-      "-ar", "8000",
-      "-ac", "1",
-      "-i", "pipe:0",
-      "-ar", "16000",
-      "-ac", "1",
-      "-f", "wav",
-      "pipe:1",
+      "-f", "mulaw", "-ar", "8000", "-ac", "1", "-i", "pipe:0",
+      "-ar", "16000", "-ac", "1", "-f", "wav", "pipe:1",
     ];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
     p.stdout.on("data", (b) => chunks.push(b));
-    p.on("close", (code) =>
-      code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`))
-    );
+    p.stderr.on("data", () => {});
+    p.on("close", (code) => code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg (mulaw->wav) exited ${code}`)));
     p.on("error", reject);
     p.stdin.end(mulawBuffer);
   });
@@ -249,6 +272,14 @@ async function generateReply(userText) {
   const json = await resp.json();
   return json.choices?.[0]?.message?.content?.trim() || "Okay.";
 }
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url === "/media-stream") {
+    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
+  } else {
+    socket.destroy();
+  }
+});
 
 server.listen(PORT, "0.0.0.0", async () => {
   console.log(`🚀 Server running on 0.0.0.0:${PORT}`);
