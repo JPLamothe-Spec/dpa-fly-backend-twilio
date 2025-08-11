@@ -1,20 +1,18 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (WS bridge)
-// - Streams Twilio audio to OpenAI Realtime and streams model audio back
-// - British / AU female voice via VOICE=verse (or sage)
-// - Silence-based auto-commit + response creation (natural turn-taking)
-// - Injects dev-mode project brief at session start
-// - Cleans up fully on hangup (no post-call loops)
+// - Live streaming voice both ways (no batch TTS/Whisper)
+// - Natural barge-in and turn-taking
+// - UK-leaning female voice via VOICE=verse (or sage)
+// - Built-in dev-mode project brief (no extra file)
+// - Clean shutdown on hangup
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const bodyParser = require("body-parser");
-const fs = require("fs");
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// ESM-friendly node-fetch in CJS
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const app = express();
@@ -23,40 +21,37 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ========= Config =========
-const PUBLIC_URL = process.env.PUBLIC_URL || ""; // e.g. your Fly URL (https://appname.fly.dev)
+// ===== Config =====
+const PUBLIC_URL = process.env.PUBLIC_URL || ""; // e.g. https://your-app.fly.dev
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const VOICE = (process.env.VOICE || "verse").toLowerCase(); // verse/sage/etc
+const VOICE = (process.env.VOICE || "verse").toLowerCase(); // try "verse" or "sage"
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
-const PROJECT_BRIEF_PATH = process.env.PROJECT_BRIEF_PATH || "./project-brief.md";
-
-// VAD / turn taking (tweak to taste)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);   // ulaw avg energy thresh
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 900);    // end turn after ~0.9s silence
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);  // cap turn to avoid run-ons
-
-// Maintenance kill-switch: reject calls instantly
 const MAINTENANCE_MODE = String(process.env.MAINTENANCE_MODE || "false").toLowerCase() === "true";
 
-// ====== Load project brief (optional) ======
-let PROJECT_BRIEF = "";
-try {
-  PROJECT_BRIEF = fs.readFileSync(PROJECT_BRIEF_PATH, "utf8");
-  console.log(`🧠 Loaded project brief (${PROJECT_BRIEF.length} chars)`);
-} catch {
-  console.log("🧠 No project brief file found; proceeding without it.");
-}
+// VAD tuning (avoid cutoffs by giving a little more silence)
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);  // μ-law energy
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);  // end turn after ~1.1s silence
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000); // hard cap per turn
 
-// ====== Simple ulaw energy ======
+// ===== Built-in project brief (override via env PROJECT_BRIEF if you like) =====
+const PROJECT_BRIEF =
+  process.env.PROJECT_BRIEF ||
+  `Digital Personal Assistant (DPA) Project
+- Goal: natural, low-latency phone assistant for JP.
+- Priorities: realtime voice, UK/AU female voice, no unsolicited number capture, low latency, smooth barge-in.
+- Dev mode: treat caller as JP (teammate). Be concise, flag issues (latency, transcription, overlap), suggest next tests.
+- Behaviours: avoid asking for phone numbers unless explicitly requested. Keep replies short unless asked to elaborate.`;
+
+// ===== Simple μ-law energy =====
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
-  return acc / buf.length; // rough 0..128
+  return acc / buf.length;
 }
 
-// ====== Twilio webhook: returns TwiML to open a media stream ======
+// ===== Twilio webhook returns TwiML to open the media stream =====
 app.post("/twilio/voice", (req, res) => {
   if (MAINTENANCE_MODE) {
     console.log("🚫 MAINTENANCE_MODE active — rejecting call");
@@ -64,12 +59,12 @@ app.post("/twilio/voice", (req, res) => {
   }
   console.log("➡️ /twilio/voice hit");
   const host = req.headers.host;
-  // Use PUBLIC_URL if you terminate behind a proxy/edge; else use live incoming host
-  const wsUrl = PUBLIC_URL ? `${PUBLIC_URL}` : `https://${host}`;
+  const base = PUBLIC_URL || `https://${host}`;
+  const wsUrl = base.replace(/^http/i, "ws");
   const twiml = `
     <Response>
       <Connect>
-        <Stream url="${wsUrl.replace(/^http/i, "ws")}/call"/>
+        <Stream url="${wsUrl}/call"/>
       </Connect>
     </Response>
   `.trim();
@@ -80,7 +75,7 @@ app.post("/twilio/voice", (req, res) => {
 app.get("/", (_req, res) => res.status(200).send("Realtime DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// ====== HTTP server + WS upgrade ======
+// ===== HTTP server + WS upgrade =====
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (request, socket, head) => {
@@ -91,7 +86,7 @@ server.on("upgrade", (request, socket, head) => {
   }
 });
 
-// ====== OpenAI Realtime connect helper ======
+// ===== OpenAI Realtime connect =====
 function connectOpenAIRealtime() {
   return new Promise((resolve, reject) => {
     const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
@@ -106,7 +101,7 @@ function connectOpenAIRealtime() {
   });
 }
 
-// ====== Audio conversion: Twilio μ-law 8k → PCM16 16k ======
+// μ-law 8k → PCM16 16k (for OpenAI input)
 function ulaw8kToPcm16k(mulawBuffer) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -124,7 +119,7 @@ function ulaw8kToPcm16k(mulawBuffer) {
   });
 }
 
-// ====== WS bridge per call ======
+// ===== Per-call bridge =====
 wss.on("connection", async (twilioWS) => {
   console.log("✅ Twilio WebSocket connected");
 
@@ -137,9 +132,9 @@ wss.on("connection", async (twilioWS) => {
   let callEnded = false;
   let streamSid = null;
 
-  // VAD state (for committing turns)
+  // VAD/turn state
   let collecting = false;
-  let pcmChunks = [];           // PCM16@16k chunks for this turn
+  let pcmChunks = [];
   let lastSpeechAt = Date.now();
   let turnStartedAt = 0;
   let vadPoll = null;
@@ -154,58 +149,23 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // When Realtime sends audio deltas, pipe to Twilio
+  // Pipe Realtime audio back to Twilio (expecting μ-law 8k from model)
   oaiWS.on("message", async (data) => {
     if (callEnded) return;
     try {
       const msg = JSON.parse(data.toString());
-      // We ask OpenAI to emit μ-law 8k frames, so we can pass straight to Twilio
       if (msg.type === "response.output_audio.delta" && msg.audio) {
-        const payloadB64 = Buffer.from(msg.audio, "base64").toString("base64"); // already mulaw@8k
-        twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: payloadB64 } }));
+        twilioWS.send(JSON.stringify({
+          event: "media", streamSid,
+          media: { payload: Buffer.from(msg.audio, "base64").toString("base64") }
+        }));
       }
       if (msg.type === "response.output_audio.done") {
         twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } }));
       }
-      // Log useful items in dev
       if (msg.type === "error") console.error("🔻 OAI error:", msg);
     } catch {}
   });
-
-  oaiWS.on("close", () => {
-    if (!callEnded) console.log("ℹ️ OpenAI Realtime closed");
-  });
-
-  oaiWS.on("error", (err) => {
-    console.error("⚠️ OpenAI Realtime error:", err?.message || err);
-  });
-
-  // Session bootstrap: voice + instructions + output audio format
-  function sendSessionUpdate() {
-    const brief = PROJECT_BRIEF ? `\n\nPROJECT BRIEF:\n${PROJECT_BRIEF}\n` : "";
-    const instructions = DEV_MODE
-      ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
-Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless requested.${brief}`
-      : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
-
-    const sess = {
-      type: "session.update",
-      session: {
-        // Stream audio out as μ-law 8k so we can pass straight to Twilio
-        audio_format: "pcm_mulaw",
-        sample_rate: 8000,
-        // Input audio is PCM16@16k (we convert from Twilio μ-law)
-        input_audio_format: "pcm16",
-        input_sample_rate: 16000,
-        // Realtime modalities
-        modalities: ["audio", "text"],
-        voice: VOICE,
-        instructions
-      }
-    };
-    oaiWS.send(JSON.stringify(sess));
-  }
-  sendSessionUpdate();
 
   function endCall(reason = "unknown") {
     if (callEnded) return;
@@ -218,7 +178,33 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
     try { if (twilioWS && twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
   }
 
-  // ====== Twilio media stream handling ======
+  // Send session setup: voice, formats, instructions
+  function sendSessionUpdate() {
+    const instructions = DEV_MODE
+      ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
+Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless requested.
+
+PROJECT BRIEF:
+${PROJECT_BRIEF}`
+      : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
+
+    const sess = {
+      type: "session.update",
+      session: {
+        audio_format: "pcm_mulaw",       // model -> μ-law@8k (pass straight to Twilio)
+        sample_rate: 8000,
+        input_audio_format: "pcm16",     // we send PCM16@16k
+        input_sample_rate: 16000,
+        modalities: ["audio", "text"],
+        voice: VOICE,
+        instructions
+      }
+    };
+    oaiWS.send(JSON.stringify(sess));
+  }
+  sendSessionUpdate();
+
+  // Handle Twilio media stream
   twilioWS.on("message", async (raw) => {
     if (callEnded) return;
     let data; try { data = JSON.parse(raw.toString()); } catch { return; }
@@ -231,7 +217,7 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid} voice=${VOICE} model=${REALTIME_MODEL} dev=${DEV_MODE}`);
-        // Start VAD / collection
+        // Start VAD
         collecting = true;
         pcmChunks = [];
         lastSpeechAt = Date.now();
@@ -245,7 +231,6 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
           const hitMax = (now - turnStartedAt) >= MAX_TURN_MS;
 
           if ((longSilence || hitMax) && pcmChunks.length) {
-            // Commit a turn to Realtime
             try {
               const pcm = Buffer.concat(pcmChunks);
               const b64 = pcm.toString("base64");
@@ -253,9 +238,8 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
               oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
               oaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
             } catch (e) {
-              console.error("❌ Failed to send to Realtime:", e?.message || e);
+              console.error("❌ send to Realtime failed:", e?.message || e);
             }
-            // reset for next turn
             pcmChunks = [];
             turnStartedAt = Date.now();
           }
@@ -267,22 +251,22 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
         if (!b64) break;
         const mulaw = Buffer.from(b64, "base64");
 
-        // VAD: update speech / silence tracking from μ-law energy
+        // VAD energy
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
 
-        // Convert to PCM16@16k and store for current turn
+        // Convert to PCM16@16k for model input
         try {
           const pcm16 = await ulaw8kToPcm16k(mulaw);
           pcmChunks.push(pcm16);
-        } catch (e) {
-          console.error("ffmpeg ulaw->pcm error:", e?.message || e);
+        } catch (err) {
+          console.error("ffmpeg ulaw->pcm error:", err?.message || err);
         }
         break;
       }
 
       case "mark":
-        // You can log tts-done here if you want
+        // Optional: observe "tts-done"
         break;
 
       case "stop":
@@ -295,7 +279,7 @@ Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless 
   twilioWS.on("error", (err) => { console.error("⚠️ Twilio WS error:", err?.message || err); endCall("ws error"); });
 });
 
-// ====== Server listen ======
+// ===== Start server =====
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Realtime server on 0.0.0.0:${PORT}`);
 });
