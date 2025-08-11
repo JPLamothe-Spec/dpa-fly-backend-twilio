@@ -31,7 +31,9 @@ const PORT = process.env.PORT || 3000;
 const GREETING_TEXT =
   process.env.GREETING_TEXT ||
   "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
-const TTS_VOICE  = process.env.TTS_VOICE  || "alloy";
+
+// 🔊 Default to a British-accented female voice
+const TTS_VOICE  = process.env.TTS_VOICE  || "verse";
 const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts";
 
 // Barge-in defaults OFF for stability; enable later via secret if desired
@@ -61,16 +63,18 @@ function ulawEnergy(buf) {
 
 // ---- Phone capture helpers (AU-focused) ----
 const AU_MOBILE_LEN = 10;
+
+// ⚠️ Trim collision-prone homophones: no "to/too", "for", "ate", "won"
 const DIGIT_WORDS = {
   "zero": "0", "oh": "0", "o": "0",
-  "one": "1", "won": "1",
-  "two": "2", "to": "2", "too": "2",
-  "three": "3", "tree": "3",
-  "four": "4", "for": "4",
+  "one": "1",
+  "two": "2",
+  "three": "3",
+  "four": "4",
   "five": "5",
   "six": "6",
   "seven": "7",
-  "eight": "8", "ate": "8",
+  "eight": "8",
   "nine": "9"
 };
 const MULTIPLIER_WORDS = { "double": 2, "triple": 3 };
@@ -115,6 +119,18 @@ function formatAuMobile(digits) {
   if (d.length < 4) return d;
   if (d.length <= 7) return `${d.slice(0,4)} ${d.slice(4)}`;
   return `${d.slice(0,4)} ${d.slice(4,7)} ${d.slice(7)}`;
+}
+
+// Strong indicators the caller intends to give a phone number
+function looksLikePhoneIntent(text = "") {
+  const t = (text || "").toLowerCase();
+  return /\b(my (mobile|cell|number|phone)|call me( back)? on|reach me on|you can call me on|it's|is|^0?4|oh four|zero four|o four)\b/.test(t);
+}
+
+// Phrases that cancel number capture
+function userCancelsNumberMode(text = "") {
+  const t = (text || "").toLowerCase();
+  return /\b(not digits|stop digits|cancel number|no number|ignore number|not giving (you )?my number|i'?m not (trying to )?say digits|don'?t take my number)\b/.test(t);
 }
 
 // --- Twilio webhook: open full-duplex media stream using <Connect><Stream>
@@ -317,37 +333,54 @@ wss.on("connection", (ws) => {
         }
 
         // === Phone capture branch (runs before GPT) ===
-        let handledByPhoneFlow = false;
-        const newlyHeard = extractDigitsFromTranscript(transcript);
-        if (newlyHeard) {
-          // If caller started giving a number, enter phone capture mode
-          expectingPhone = true;
-          phoneDigits += newlyHeard;
-          // Trim to max length
-          if (phoneDigits.length > AU_MOBILE_LEN) phoneDigits = phoneDigits.slice(0, AU_MOBILE_LEN);
-        }
-
-        if (expectingPhone) {
-          if (phoneDigits.length === 0) {
-            await speakAndContinue("What’s the best number for JP to call you back on? Please say it digit by digit.");
-            handledByPhoneFlow = true;
-          } else if (phoneDigits.length < AU_MOBILE_LEN) {
-            const remaining = AU_MOBILE_LEN - phoneDigits.length;
-            await speakAndContinue(`I have ${formatAuMobile(phoneDigits)}. Please say the next ${remaining} digit${remaining===1?"":"s"}, one at a time.`);
-            handledByPhoneFlow = true;
-          } else {
-            // We have 10 digits — confirm
-            const pretty = formatAuMobile(phoneDigits);
-            await speakAndContinue(`Just to confirm, is your number ${pretty}?`);
-            handledByPhoneFlow = true;
-            // Stay in expectingPhone=true; next user turn should confirm yes/no
+        // DEV MODE SHORT-CIRCUIT: disable phone capture entirely during dev mode
+        if (devModeActive) {
+          expectingPhone = false;
+          phoneDigits = "";
+        } else {
+          // Exit signals from the user
+          if (userCancelsNumberMode(transcript)) {
+            expectingPhone = false;
+            phoneDigits = "";
+            await speakAndContinue("No worries — I’ll ignore numbers for now. What would you like to test?");
+            collectAttempts = 0;
+            return startCollectingWindow(5000);
           }
-        }
 
-        if (handledByPhoneFlow) {
-          // Open another listen window and return early
-          collectAttempts = 0;
-          return startCollectingWindow(5000);
+          // Only parse digits if we are expecting a number OR the user clearly indicates a phone-number intent
+          const phoneIntent = looksLikePhoneIntent(transcript);
+          const allowDigitParse = expectingPhone || phoneIntent;
+
+          let handledByPhoneFlow = false;
+          if (allowDigitParse) {
+            const newlyHeard = extractDigitsFromTranscript(transcript);
+            if (newlyHeard) {
+              expectingPhone = true; // enter/keep number mode once digits start
+              phoneDigits += newlyHeard;
+              if (phoneDigits.length > AU_MOBILE_LEN) phoneDigits = phoneDigits.slice(0, AU_MOBILE_LEN);
+            }
+
+            if (expectingPhone) {
+              if (phoneDigits.length === 0) {
+                await speakAndContinue("What’s the best number for JP to call you back on? Please say it digit by digit.");
+                handledByPhoneFlow = true;
+              } else if (phoneDigits.length < AU_MOBILE_LEN) {
+                const remaining = AU_MOBILE_LEN - phoneDigits.length;
+                await speakAndContinue(`I have ${formatAuMobile(phoneDigits)}. Please say the next ${remaining} digit${remaining===1?"":"s"}, one at a time.`);
+                handledByPhoneFlow = true;
+              } else {
+                const pretty = formatAuMobile(phoneDigits);
+                await speakAndContinue(`Just to confirm, is your number ${pretty}?`);
+                handledByPhoneFlow = true;
+                // remain in expectingPhone=true awaiting yes/no
+              }
+            }
+          }
+
+          if (handledByPhoneFlow) {
+            collectAttempts = 0;
+            return startCollectingWindow(5000);
+          }
         }
 
         // === Hybrid intent for short phrases & dev mode toggles (before GPT) ===
@@ -355,12 +388,20 @@ wss.on("connection", (ws) => {
 
         if (intent.type === "dev_on") {
           devModeActive = true;
+          console.log("🛠️ Dev mode ENABLED (via voice)");
           await speakAndContinue("Dev mode enabled. I’ll share brief diagnostics as we test.");
           collectAttempts = 0; return startCollectingWindow(5000);
         }
         if (intent.type === "dev_off") {
           devModeActive = false;
+          console.log("🛠️ Dev mode DISABLED (via voice)");
           await speakAndContinue("Dev mode disabled. I’ll keep it simple for callers.");
+          collectAttempts = 0; return startCollectingWindow(5000);
+        }
+        if (intent.type === "cancel_numbers") {
+          expectingPhone = false;
+          phoneDigits = "";
+          await speakAndContinue("Got it — I’ll stop capturing numbers. What would you like me to do?");
           collectAttempts = 0; return startCollectingWindow(5000);
         }
 
@@ -477,6 +518,11 @@ function simpleIntent(userText = "") {
   // dev mode toggles (voice)
   if (/\b(dev mode on|developer mode on)\b/i.test(t)) return { type: "dev_on" };
   if (/\b(dev mode off|developer mode off)\b/i.test(t)) return { type: "dev_off" };
+
+  // user asks to stop number capture
+  if (/\b(not digits|stop digits|cancel number|no number|ignore number|not giving (you )?my number|i'?m not (trying to )?say digits|don'?t take my number)\b/.test(t)) {
+    return { type: "cancel_numbers" };
+  }
 
   return { type: "freeform" };
 }
