@@ -3,7 +3,7 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
-const DEFAULT_VOICE = process.env.TTS_VOICE || "verse";          // British female by default
+const DEFAULT_VOICE = process.env.TTS_VOICE || "aria";            // British female by default
 const DEFAULT_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
 console.log(`🎙️ TTS voice=${DEFAULT_VOICE} model=${DEFAULT_MODEL}`);
@@ -96,6 +96,11 @@ async function warmGreeting({ text, voice = DEFAULT_VOICE, model = DEFAULT_MODEL
   }
 }
 
+function clearGreetingCache() {
+  greetingCache.clear();
+  console.log("🧹 TTS greeting cache cleared");
+}
+
 // Minimal fallback “tone” (neutral buffer) if no API key set
 async function startPlaybackTone({ ws, streamSid, controller, logPrefix = "TONE" }) {
   const silence = Buffer.alloc(8000 / 2);
@@ -107,5 +112,6 @@ module.exports = {
   startPlaybackTone,
   warmGreeting,
   playCachedGreeting,
+  clearGreetingCache,
   TtsController,
 };
