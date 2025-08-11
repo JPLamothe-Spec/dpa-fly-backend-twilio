@@ -1,4 +1,8 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end, robust TwiML + logging)
+// Twilio PSTN ↔ OpenAI Realtime (μ-law end-to-end, hardcoded Stream URL)
+// - No ffmpeg, no resampling: g711_ulaw 8k in/out
+// - Proactive greeting; simple VAD turn-taking
+// - Dev brief inline; UK-leaning female voice via VOICE=verse
+// - Hard override STREAM_WS_URL so Twilio always connects correctly
 
 const express = require("express");
 const http = require("http");
@@ -12,118 +16,79 @@ app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 
-/* ===== Config ===== */
-const STREAM_WS_URL = process.env.STREAM_WS_URL || ""; // e.g. wss://dpa-fly-backend-twilio.fly.dev/call  (hard override)
-const PUBLIC_URL    = process.env.PUBLIC_URL || "";    // e.g. https://dpa-fly-backend-twilio.fly.dev
+/* ===== Hardcoded Stream URL (Option A) =====
+   Make sure this matches your Fly app URL.
+   You can still override at runtime by setting STREAM_WS_URL env if you want. */
+const STREAM_WS_URL =
+  process.env.STREAM_WS_URL || "wss://dpa-fly-backend-twilio.fly.dev/call";
+
+/* ===== OpenAI Realtime config ===== */
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const VOICE = (process.env.VOICE || "verse").toLowerCase();
+const REALTIME_MODEL =
+  process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
+const VOICE = (process.env.VOICE || "verse").toLowerCase(); // try "sage" if you want a different female timbre
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
-const MAINTENANCE_MODE = String(process.env.MAINTENANCE_MODE || "false").toLowerCase() === "true";
 
-/* ===== VAD ===== */
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);
+/* ===== VAD / Turn-taking ===== */
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);  // μ-law energy threshold
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);  // end turn after ~1.1s silence
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000); // cap a single turn
 
-/* ===== Brief ===== */
-const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA) Project
+/* ===== Project brief (inline) ===== */
+const PROJECT_BRIEF =
+  process.env.PROJECT_BRIEF ||
+  `Digital Personal Assistant (DPA) Project
 - Goal: natural, low-latency phone assistant for JP.
 - Priorities: realtime voice, UK/AU female voice, no unsolicited number capture, low latency, smooth barge-in.
 - Dev mode: treat caller as JP (teammate). Be concise, flag issues (latency, transcription, overlap), suggest next tests.
 - Behaviours: avoid asking for phone numbers unless explicitly requested. Keep replies short unless asked to elaborate.`;
 
 /* ===== Helpers ===== */
-function ulawEnergy(buf){ let s=0; for(let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
-function toWssBase(urlLike, fallbackHost) {
-  if (!urlLike) return `wss://${fallbackHost}`;
-  // Accept ws://, wss://, http://, https://
-  try {
-    const u = new URL(urlLike);
-    if (u.protocol === "wss:" || u.protocol === "ws:") {
-      // ensure wss
-      u.protocol = "wss:";
-      return u.toString().replace(/\/+$/, "");
-    }
-    if (u.protocol === "https:" || u.protocol === "http:") {
-      u.protocol = "wss:";
-      return u.toString().replace(/\/+$/, "");
-    }
-  } catch (_) {
-    // not a full URL; assume host
-    return `wss://${urlLike}`;
-  }
-  return `wss://${fallbackHost}`;
-}
-function ensureCallPath(wssBase) {
-  try {
-    const u = new URL(wssBase);
-    if (!u.pathname || u.pathname === "/") {
-      u.pathname = "/call";
-      return u.toString();
-    }
-    // if path doesn't end with /call, append
-    if (!u.pathname.endsWith("/call")) {
-      u.pathname = (u.pathname.replace(/\/+$/, "")) + "/call";
-    }
-    return u.toString();
-  } catch { return wssBase.endsWith("/call") ? wssBase : `${wssBase.replace(/\/+$/, "")}/call`; }
+function ulawEnergy(buf) {
+  let s = 0;
+  for (let i = 0; i < buf.length; i++) s += Math.abs(buf[i] - 0x7f);
+  return s / buf.length;
 }
 
-/* ===== TwiML builder (used by both GET/POST) ===== */
-function buildTwiml(req) {
-  if (MAINTENANCE_MODE) return `<Response><Reject/></Response>`;
-
-  const incomingHost = req.headers.host; // e.g. dpa-fly-backend-twilio.fly.dev
-  let wssBase;
-
-  if (STREAM_WS_URL) {
-    // Hard override (best for debugging)
-    if (!/^wss?:\/\//i.test(STREAM_WS_URL)) {
-      wssBase = `wss://${STREAM_WS_URL}`;
-    } else {
-      wssBase = STREAM_WS_URL;
-    }
-  } else if (PUBLIC_URL) {
-    wssBase = toWssBase(PUBLIC_URL, incomingHost);
-  } else {
-    wssBase = `wss://${incomingHost}`;
-  }
-
-  const finalWss = ensureCallPath(wssBase);
-  const twiml = `
+/* ===== Twilio webhook: return TwiML with hardcoded WS URL ===== */
+function twiml() {
+  return `
     <Response>
       <Connect>
-        <Stream url="${finalWss}" track="inbound_audio"/>
+        <Stream url="${STREAM_WS_URL}" track="inbound_audio"/>
       </Connect>
     </Response>
   `.trim();
-
-  console.log("🧾 TwiML returned:", twiml);
-  return twiml;
 }
 
-/* ===== Twilio webhook (support POST + GET just in case) ===== */
 app.post("/twilio/voice", (req, res) => {
   console.log("➡️ /twilio/voice hit (POST)");
-  res.type("text/xml").send(buildTwiml(req));
-});
-app.get("/twilio/voice", (req, res) => {
-  console.log("➡️ /twilio/voice hit (GET)");
-  res.type("text/xml").send(buildTwiml(req));
+  const xml = twiml();
+  console.log("🧾 TwiML returned:", xml);
+  res.type("text/xml").send(xml);
 });
 
-/* Health */
+app.get("/twilio/voice", (req, res) => {
+  console.log("➡️ /twilio/voice hit (GET)");
+  const xml = twiml();
+  console.log("🧾 TwiML returned:", xml);
+  res.type("text/xml").send(xml);
+});
+
+/* ===== Health ===== */
 app.get("/", (_req, res) => res.status(200).send("Realtime DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 /* ===== HTTP + WS ===== */
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
+
 server.on("upgrade", (request, socket, head) => {
   if (request.url === "/call") {
-    wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
+    wss.handleUpgrade(request, socket, head, (ws) =>
+      wss.emit("connection", ws, request)
+    );
   } else {
     socket.destroy();
   }
@@ -132,7 +97,9 @@ server.on("upgrade", (request, socket, head) => {
 /* ===== OpenAI Realtime connect ===== */
 function connectOpenAIRealtime() {
   return new Promise((resolve, reject) => {
-    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`;
+    const url = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
+      REALTIME_MODEL
+    )}`;
     const oai = new WebSocket(url, {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -154,16 +121,16 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  let callEnded = false;
   let streamSid = null;
+  let callEnded = false;
 
-  // VAD / buffer
+  // VAD/turn state
   let mulawChunks = [];
   let lastSpeechAt = Date.now();
   let turnStartedAt = 0;
   let vadPoll = null;
 
-  // Connect to OpenAI
+  // Connect Realtime
   let oaiWS;
   try {
     oaiWS = await connectOpenAIRealtime();
@@ -173,7 +140,7 @@ wss.on("connection", async (twilioWS) => {
     return;
   }
 
-  // OAI -> Twilio audio
+  // OpenAI -> Twilio audio stream
   oaiWS.on("message", (data) => {
     if (callEnded) return;
     try {
@@ -188,13 +155,15 @@ wss.on("connection", async (twilioWS) => {
       if (msg.type === "response.output_audio.done") {
         twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } }));
       }
-      if (msg.type === "error") console.error("🔻 OAI error:", msg);
+      if (msg.type === "error") {
+        console.error("🔻 OAI error:", msg);
+      }
     } catch (e) {
       console.error("⚠️ Failed to parse OAI message", e?.message || e);
     }
   });
 
-  function endCall(reason="unknown") {
+  function endCall(reason = "unknown") {
     if (callEnded) return;
     callEnded = true;
     console.log("🛑 Ending call:", reason);
@@ -204,7 +173,7 @@ wss.on("connection", async (twilioWS) => {
     try { if (twilioWS && twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
   }
 
-  // Send session setup
+  // Send session setup (μ-law in/out, voice, instructions)
   function sendSessionUpdate() {
     const instructions = DEV_MODE
       ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
@@ -217,8 +186,8 @@ ${PROJECT_BRIEF}`
     const sess = {
       type: "session.update",
       session: {
-        input_audio_format:  "g711_ulaw",
-        output_audio_format: "g711_ulaw",
+        input_audio_format:  "g711_ulaw", // Twilio μ-law @ 8k
+        output_audio_format: "g711_ulaw", // Send μ-law back to Twilio
         modalities: ["audio", "text"],
         voice: VOICE,
         instructions
@@ -231,9 +200,13 @@ ${PROJECT_BRIEF}`
   // Twilio media handling
   twilioWS.on("message", async (raw) => {
     if (callEnded) return;
-    let data; try { data = JSON.parse(raw.toString()); } catch { return; }
+    let data;
+    try { data = JSON.parse(raw.toString()); } catch { return; }
 
-    if (!data.event) { console.log("ℹ️ Twilio message without event:", data); return; }
+    if (!data.event) {
+      console.log("ℹ️ Twilio message without event:", data);
+      return;
+    }
 
     switch (data.event) {
       case "connected":
@@ -243,17 +216,24 @@ ${PROJECT_BRIEF}`
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid} voice=${VOICE} model=${REALTIME_MODEL} dev=${DEV_MODE}`);
+
         mulawChunks = [];
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
 
-        // Proactive greeting
+        // Proactive greeting so you hear Anna immediately
         try {
-          oaiWS.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio"] } }));
-        } catch (e) { console.error("❌ initial greeting failed:", e?.message || e); }
+          oaiWS.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio"] }
+          }));
+        } catch (e) {
+          console.error("❌ initial greeting failed:", e?.message || e);
+        }
 
         if (vadPoll) { clearInterval(vadPoll); vadPoll = null; }
         vadPoll = setInterval(() => {
+          if (callEnded) return;
           const now = Date.now();
           const longSilence = (now - lastSpeechAt) >= SILENCE_MS;
           const hitMax = (now - turnStartedAt) >= MAX_TURN_MS;
@@ -278,13 +258,18 @@ ${PROJECT_BRIEF}`
         const b64 = data?.media?.payload;
         if (!b64) break;
         const mulaw = Buffer.from(b64, "base64");
+
+        // VAD energy detect
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
+
+        // accumulate raw μ-law
         mulawChunks.push(mulaw);
         break;
       }
 
       case "mark":
+        // tts-done marker from our own responses if needed
         break;
 
       case "stop":
