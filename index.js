@@ -1,7 +1,8 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), stable WS + audible output
-// - Voice set to a supported Realtime voice ("alloy")
-// - Proactive greeting via response.create with ["audio","text"]
-// - Commit guards (min bytes + non-empty buffer) and clearer logging
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), audio-out fixed
+// Key fixes:
+//  - Forward OpenAI audio using the correct event/field: response.audio.delta → msg.delta
+//  - Still accept response.output_audio.delta → msg.audio (older examples)
+//  - Log bytes sent to Twilio for visibility
 
 const express = require("express");
 const http = require("http");
@@ -17,11 +18,11 @@ const PORT = process.env.PORT || 3000;
 const STREAM_WS_URL = process.env.STREAM_WS_URL || "wss://dpa-fly-backend-twilio.fly.dev/call";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const VOICE = (process.env.VOICE || "alloy").toLowerCase(); // ✅ supported voice
+const VOICE = (process.env.VOICE || "alloy").toLowerCase();
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// μ-law @ 8kHz ⇒ 100ms ≈ 800 bytes (20ms frames of 160B)
+// μ-law @ 8kHz ⇒ ~800 bytes ≈ 100ms
 const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);
@@ -100,6 +101,7 @@ wss.on("connection", async (twilioWS, req) => {
   let lastSpeechAt = Date.now();
   let turnStartedAt = Date.now();
   let mediaPackets = 0;
+  let sentBytesToTwilio = 0;
 
   oai.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
@@ -112,7 +114,6 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
 
-    // μ-law I/O + voice + modalities
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -127,7 +128,7 @@ ${PROJECT_BRIEF}`
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // Extra visibility into OpenAI events
+  // ---- OpenAI -> Twilio audio forwarder (handles both event shapes) ----
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
@@ -135,32 +136,48 @@ ${PROJECT_BRIEF}`
       console.log("🧠 OAI:", msg.type);
     }
 
-    // Only send audio after Twilio START gives us streamSid
-    if (streamSid && msg.type === "response.output_audio.delta" && msg.audio) {
+    if (!streamSid) return;
+
+    // A) Modern event: response.audio.delta  (data in msg.delta)
+    if (msg.type === "response.audio.delta" && msg.delta) {
+      const chunkB64 = msg.delta; // already μ-law/8k base64 per our session.update
       try {
-        twilioWS.send(JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: Buffer.from(msg.audio, "base64").toString("base64") }
-        }));
+        twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: chunkB64 } }));
+        sentBytesToTwilio += Buffer.from(chunkB64, "base64").length;
+        if (sentBytesToTwilio < 2000 || sentBytesToTwilio % 48000 === 0) {
+          console.log(`📤 sent to Twilio: ${sentBytesToTwilio} bytes total`);
+        }
       } catch (e) {
         console.error("❌ send audio to Twilio failed:", e?.message || e);
       }
     }
 
-    if (msg.type === "response.output_text.delta" && msg.delta) {
-      // Optional: text transcript as it streams
-      console.log("📝 text.delta:", msg.delta.slice(0, 200));
+    // B) Older shape: response.output_audio.delta  (data in msg.audio)
+    if (msg.type === "response.output_audio.delta" && msg.audio) {
+      const chunkB64 = msg.audio;
+      try {
+        twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: chunkB64 } }));
+        sentBytesToTwilio += Buffer.from(chunkB64, "base64").length;
+        if (sentBytesToTwilio < 2000 || sentBytesToTwilio % 48000 === 0) {
+          console.log(`📤 sent to Twilio: ${sentBytesToTwilio} bytes total`);
+        }
+      } catch (e) {
+        console.error("❌ send audio to Twilio failed:", e?.message || e);
+      }
     }
 
-    if (msg.type === "response.output_audio.done") {
+    if (msg.type === "response.audio.done" || msg.type === "response.output_audio.done") {
       try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
+    }
+
+    if (msg.type === "response.output_text.delta" && msg.delta) {
+      console.log("📝 text.delta:", String(msg.delta).slice(0, 200));
     }
 
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
-  // Commit when silence/max-turn AND enough audio buffered
+  // ---- VAD/turn-taking: commit caller audio when it’s ready ----
   const vadPoll = setInterval(() => {
     const now = Date.now();
     const longSilence = now - lastSpeechAt >= SILENCE_MS;
@@ -201,10 +218,11 @@ ${PROJECT_BRIEF}`
         mulawChunks = [];
         bytesBuffered = 0;
         mediaPackets = 0;
+        sentBytesToTwilio = 0;
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
 
-        // Proactive greeting (no input required)
+        // Proactive greeting
         try {
           oai.send(JSON.stringify({
             type: "response.create",
