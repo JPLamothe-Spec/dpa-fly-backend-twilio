@@ -1,18 +1,16 @@
 {
   "name": "dpa-realtime-twilio",
   "version": "1.0.0",
-  "description": "Twilio Media Streams ↔ OpenAI Realtime bridge",
+  "description": "Twilio Media Streams ↔ OpenAI Realtime bridge (μ-law end-to-end)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
-    "dev": "NODE_ENV=development node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "body-parser": "^1.20.2",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
     "ws": "^8.17.0"
   }
 }
