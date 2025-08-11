@@ -1,4 +1,4 @@
-// index.js — Full duplex with cached fast greeting + barge-in + 1-turn ASR (Whisper) -> GPT -> TTS reply
+// index.js — Full duplex with cached fast greeting + robust barge-in + 1-turn ASR (Whisper) -> GPT -> TTS reply
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
@@ -8,7 +8,7 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3 in CJS)
+// ESM-friendly fetch shim
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const {
@@ -30,14 +30,16 @@ const GREETING_TEXT =
 const TTS_VOICE = process.env.TTS_VOICE || "alloy";
 const TTS_MODEL = process.env.TTS_MODEL || "gpt-4o-mini-tts";
 
-// ---------- Simple μ-law energy (for barge-in) ----------
+// ---------- μ-law energy (for barge-in) ----------
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
-  return acc / buf.length; // ~0..128
+  return acc / buf.length; // ~0..128 (rough)
 }
-const SPEECH_THRESH = 12;             // tweak if needed
-const SILENCE_BEFORE_REPLY_MS = 400;  // wait this long of quiet before speaking
+// More conservative to avoid line-noise false positives:
+const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 18);
+const HOT_FRAMES = Number(process.env.BARGE_IN_FRAMES || 6); // ~120ms @ 20ms frames
+const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 400);
 
 // --- Twilio webhook: open full-duplex media stream
 app.post("/twilio/voice", (req, res) => {
@@ -59,7 +61,7 @@ app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const server = http.createServer(app);
 
-// ---- Single WebSocket server (noServer=true) + single upgrade handler (fixes double-upgrade crash)
+// ---- Single WebSocket server + single upgrade handler
 const wss = new WebSocket.Server({ noServer: true });
 server.on("upgrade", (request, socket, head) => {
   if (request.url === "/media-stream") {
@@ -83,6 +85,11 @@ wss.on("connection", (ws) => {
   let ttsController = null;
   let lastSpeechAt = 0;
 
+  // Barge-in gating
+  let allowBargeIn = false;      // disabled during greeting
+  let speechHotCount = 0;        // consecutive hot frames
+  let greetingSafetyTimer = null;
+
   ws.on("message", async (msg) => {
     let data;
     try { data = JSON.parse(msg.toString()); } catch { return; }
@@ -96,7 +103,7 @@ wss.on("connection", (ws) => {
         streamSid = data.start?.streamSid || null;
         console.log(`🔗 Stream started. streamSid=${streamSid}`);
 
-        // Greeting
+        // Greet
         if (!process.env.OPENAI_API_KEY) {
           console.log("🔊 Playback mode: Tone (no OPENAI_API_KEY set)");
           ttsController = new TtsController();
@@ -114,21 +121,47 @@ wss.on("connection", (ws) => {
           }).catch((e) => console.error("TTS/playback error:", e?.message || e));
         }
 
-        // Do NOT collect until greeting finishes
+        // While greeting is playing, barge-in is disabled
+        allowBargeIn = false;
+        greetingDone = false;
         stopCollecting();
+
+        // Safety: if Twilio never echoes mark, enable listening after ~2.5s
+        if (greetingSafetyTimer) clearTimeout(greetingSafetyTimer);
+        greetingSafetyTimer = setTimeout(() => {
+          if (!greetingDone) {
+            console.log("⏱️ Greeting safety timeout — enabling barge-in & listening");
+            allowBargeIn = true;
+            greetingDone = true;
+            startCollectingWindow(4500);
+          }
+        }, 2500);
         break;
 
       case "media":
         if (data?.media?.payload) {
           const chunk = Buffer.from(data.media.payload, "base64");
 
-          // Barge-in: if caller is speaking, cancel any active TTS immediately
-          const e = ulawEnergy(chunk);
-          if (e > SPEECH_THRESH) {
-            lastSpeechAt = Date.now();
-            if (ttsController && !ttsController.cancelled) {
-              ttsController.cancel();
-              console.log("🔇 Barge-in: caller speech detected — cancelling TTS");
+          // Barge-in detection (only if enabled)
+          if (allowBargeIn) {
+            const e = ulawEnergy(chunk);
+            if (e > SPEECH_THRESH) {
+              speechHotCount = Math.min(HOT_FRAMES + 1, speechHotCount + 1);
+              lastSpeechAt = Date.now();
+              if (speechHotCount >= HOT_FRAMES) {
+                if (ttsController && !ttsController.cancelled) {
+                  ttsController.cancel();
+                  console.log("🔇 Barge-in: caller speech detected — cancelling TTS");
+                }
+                // If greeting hadn't finished, switch to listening immediately
+                if (!greetingDone) {
+                  greetingDone = true;
+                  startCollectingWindow(4500);
+                }
+              }
+            } else {
+              // cool down quickly to avoid sticky state
+              speechHotCount = Math.max(0, speechHotCount - 2);
             }
           }
 
@@ -140,8 +173,9 @@ wss.on("connection", (ws) => {
         console.log("📍 Twilio mark:", data?.mark?.name);
         if ((data?.mark?.name === "tts-done" || data?.mark?.name === "TONE-done") && !greetingDone) {
           greetingDone = true;
-          // Start first collection window AFTER greeting is confirmed finished
-          startCollectingWindow(4000);
+          allowBargeIn = true;               // enable barge-in AFTER greeting is done
+          if (greetingSafetyTimer) { clearTimeout(greetingSafetyTimer); greetingSafetyTimer = null; }
+          startCollectingWindow(4000);        // begin first listen window
         }
         break;
 
@@ -154,6 +188,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     stopCollecting();
+    if (greetingSafetyTimer) { clearTimeout(greetingSafetyTimer); greetingSafetyTimer = null; }
     console.log("❌ WebSocket closed");
   });
 
@@ -201,7 +236,7 @@ wss.on("connection", (ws) => {
           controller: ttsController
         });
 
-        // Keep the convo going with a new window
+        // New window to keep the convo going
         collectAttempts = 0;
         startCollectingWindow(5000);
       } catch (e) {
@@ -252,7 +287,8 @@ async function transcribeWithWhisper(wavBuffer) {
 
 async function generateReply(userText) {
   if (!process.env.OPENAI_API_KEY) return "Sorry, I didn’t catch that.";
-  const system = "You are Anna, JP's friendly Australian digital assistant. Keep replies short and helpful.";
+  const system =
+    "You are Anna, JP's friendly Australian digital assistant. Keep replies short and helpful.";
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
