@@ -1,8 +1,7 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), WS-ok + audio fixes
-// Changes:
-//  - response.create uses ["audio","text"] (fixes invalid modalities)
-//  - Commit only when ≥100ms (~800 bytes) buffered (fixes empty-buffer errors)
-//  - Media packet counters for visibility
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), stable WS + audible output
+// - Voice set to a supported Realtime voice ("alloy")
+// - Proactive greeting via response.create with ["audio","text"]
+// - Commit guards (min bytes + non-empty buffer) and clearer logging
 
 const express = require("express");
 const http = require("http");
@@ -18,11 +17,11 @@ const PORT = process.env.PORT || 3000;
 const STREAM_WS_URL = process.env.STREAM_WS_URL || "wss://dpa-fly-backend-twilio.fly.dev/call";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
-const VOICE = (process.env.VOICE || "verse").toLowerCase();
+const VOICE = (process.env.VOICE || "alloy").toLowerCase(); // ✅ supported voice
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// μ-law @ 8kHz ⇒ ~800 bytes = 100ms
+// μ-law @ 8kHz ⇒ 100ms ≈ 800 bytes (20ms frames of 160B)
 const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);
@@ -88,9 +87,7 @@ server.on("upgrade", (req, socket, head) => {
 // --- Bridge Twilio <-> OpenAI Realtime ---
 wss.on("connection", async (twilioWS, req) => {
   console.log("✅ Twilio WebSocket connected from", req.headers["x-forwarded-for"] || req.socket.remoteAddress);
-  if (!OPENAI_API_KEY) {
-    console.error("❌ OPENAI_API_KEY not set — closing"); try { twilioWS.close(); } catch {} ; return;
-  }
+  if (!OPENAI_API_KEY) { console.error("❌ OPENAI_API_KEY not set — closing"); try { twilioWS.close(); } catch {}; return; }
 
   const oai = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
@@ -115,6 +112,7 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
 
+    // μ-law I/O + voice + modalities
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -129,11 +127,16 @@ ${PROJECT_BRIEF}`
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // OAI -> Twilio audio
+  // Extra visibility into OpenAI events
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
-    if (!streamSid) return;
-    if (msg.type === "response.output_audio.delta" && msg.audio) {
+
+    if (msg.type?.startsWith("response.")) {
+      console.log("🧠 OAI:", msg.type);
+    }
+
+    // Only send audio after Twilio START gives us streamSid
+    if (streamSid && msg.type === "response.output_audio.delta" && msg.audio) {
       try {
         twilioWS.send(JSON.stringify({
           event: "media",
@@ -144,9 +147,16 @@ ${PROJECT_BRIEF}`
         console.error("❌ send audio to Twilio failed:", e?.message || e);
       }
     }
+
+    if (msg.type === "response.output_text.delta" && msg.delta) {
+      // Optional: text transcript as it streams
+      console.log("📝 text.delta:", msg.delta.slice(0, 200));
+    }
+
     if (msg.type === "response.output_audio.done") {
       try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
     }
+
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
@@ -155,21 +165,25 @@ ${PROJECT_BRIEF}`
     const now = Date.now();
     const longSilence = now - lastSpeechAt >= SILENCE_MS;
     const hitMax = now - turnStartedAt >= MAX_TURN_MS;
+    const haveAudio = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
 
-    if ((longSilence || hitMax) && bytesBuffered >= MIN_COMMIT_BYTES) {
-      const b64 = Buffer.concat(mulawChunks).toString("base64");
+    if ((longSilence || hitMax) && haveAudio) {
+      const payloadBuf = Buffer.concat(mulawChunks);
+      const b64 = payloadBuf.toString("base64");
+      const ms = Math.round((payloadBuf.length / 800) * 100); // ~bytes→ms at 8k μ-law
+
       try {
         oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
         oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
         oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
-        // reset
-        mulawChunks = [];
-        bytesBuffered = 0;
-        turnStartedAt = Date.now();
-        console.log(`🔊 committed ~${Math.round((b64.length*0.75)/80)}ms (${bytesBuffered} bytes pre-reset)`);
+        console.log(`🔊 committed ~${ms}ms (${payloadBuf.length} bytes)`);
       } catch (e) {
         console.error("❌ send to Realtime failed:", e?.message || e);
       }
+      // reset after logging
+      mulawChunks = [];
+      bytesBuffered = 0;
+      turnStartedAt = Date.now();
     }
   }, 50);
 
@@ -180,6 +194,7 @@ ${PROJECT_BRIEF}`
       case "connected":
         console.log("📞 Twilio media stream connected");
         break;
+
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
@@ -188,28 +203,36 @@ ${PROJECT_BRIEF}`
         mediaPackets = 0;
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
+
         // Proactive greeting (no input required)
-        try { oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } })); } catch {}
+        try {
+          oai.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio","text"], instructions: "Greet the caller briefly and naturally, then ask how you can help." }
+          }));
+        } catch {}
         break;
+
       case "media": {
         const b64 = data?.media?.payload; if (!b64) break;
         const mulaw = Buffer.from(b64, "base64");
         mediaPackets += 1;
-        if (mediaPackets <= 5 || mediaPackets % 50 === 0) {
-          console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
-        }
+        if (mediaPackets <= 5 || mediaPackets % 50 === 0) console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
         mulawChunks.push(mulaw);
         bytesBuffered += mulaw.length;
         break;
       }
+
       case "mark":
         break;
+
       case "stop":
         console.log("🛑 Twilio STOP event");
         cleanup();
         break;
+
       default:
         console.log("ℹ️ Twilio event:", data.event);
     }
