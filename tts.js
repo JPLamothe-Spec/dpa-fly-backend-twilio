@@ -1,19 +1,22 @@
-// tts.js — paced outbound μ-law using ffmpeg-static (+gain, silence tail) + GREETING CACHE
+// tts.js — paced outbound μ-law using ffmpeg-static (+gain, silence tail) + greeting cache + cancelable TTS
 const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3)
+// ESM-friendly fetch shim (avoids CommonJS crash with node-fetch v3 in CJS)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const FRAME_BYTES = 160;   // 20ms @ 8k μ-law
 const FRAME_MS = 20;
 
-// In-memory greeting cache (μ-law buffer)
-let cachedGreeting = null;
-let cachedGreetingKey = null; // text|voice|model signature
+// ---------- Cancelable controller for barge-in ----------
+class TtsController {
+  constructor(){ this._cancelled = false; }
+  cancel(){ this._cancelled = true; }
+  get cancelled(){ return this._cancelled; }
+}
 
-// Send a single frame
+// ---------- Twilio helpers ----------
 function sendMediaFrame(ws, streamSid, chunk) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({
@@ -23,7 +26,6 @@ function sendMediaFrame(ws, streamSid, chunk) {
   }));
 }
 
-// Send a mark (Twilio will echo it back)
 function sendMark(ws, streamSid, name) {
   if (!ws || ws.readyState !== ws.OPEN) return;
   ws.send(JSON.stringify({
@@ -33,8 +35,8 @@ function sendMark(ws, streamSid, name) {
   }));
 }
 
-// Build 20ms frames and pace them; append a short μ-law silence tail to ensure clean end
-function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true, tailMs = 600 } = {}) {
+// ---------- μ-law frame pacing (supports cancel) ----------
+function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true, tailMs = 600 } = {}, controller = null) {
   return new Promise((resolve) => {
     const frames = [];
     for (let i = 0; i < mulawBuffer.length; i += FRAME_BYTES) {
@@ -54,6 +56,7 @@ function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true, t
 
     let idx = 0;
     const timer = setInterval(() => {
+      if (controller && controller.cancelled) { clearInterval(timer); return resolve(); }
       if (!ws || ws.readyState !== ws.OPEN) { clearInterval(timer); return resolve(); }
       if (idx >= frames.length) { clearInterval(timer); return resolve(); }
       sendMediaFrame(ws, streamSid, frames[idx++]);
@@ -61,34 +64,11 @@ function paceAndSendMuLaw(ws, streamSid, mulawBuffer, { addSilenceTail = true, t
   });
 }
 
-// Tone playback with gain
-async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPrefix = "TONE" }) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      "-f","lavfi","-i",`sine=frequency=${freq}:duration=${seconds}`,
-      "-filter:a","volume=2.0",      // +6 dB gain
-      "-ar","8000","-ac","1","-f","mulaw","pipe:1"
-    ];
-    const p = spawn(ffmpegPath, args);
-    const chunks = [];
-    p.stdout.on("data", (buf) => chunks.push(buf));
-    p.on("close", async (code) => {
-      if (code !== 0) return reject(new Error(`${logPrefix} ffmpeg exited with code ${code}`));
-      const out = Buffer.concat(chunks);
-      await paceAndSendMuLaw(ws, streamSid, out, { tailMs: 600 });
-      sendMark(ws, streamSid, `${logPrefix}-done`);
-      console.log(`${logPrefix}: sent ~${out.length} bytes μ-law (paced, +gain)`);
-      resolve();
-    });
-    p.on("error", reject);
-  });
-}
-
-// OpenAI TTS -> μ-law@8k -> paced (with gain)
-async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
+// ---------- Core TTS playback (OpenAI -> mp3 -> μ-law -> paced) ----------
+async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts", controller = null }) {
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for TTS mode");
 
-  // 1) Fetch TTS audio (MP3) from OpenAI
+  // 1) Fetch MP3
   const resp = await fetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: {
@@ -100,24 +80,63 @@ async function startPlaybackFromTTS({ ws, streamSid, text, voice = "alloy", mode
   if (!resp.ok) throw new Error(`OpenAI TTS failed: ${resp.status} ${await resp.text().catch(() => "")}`);
   const mp3Buffer = Buffer.from(await resp.arrayBuffer());
 
-  // 2) Transcode MP3 -> μ-law@8k, boost gain, then pace to Twilio
+  // 2) MP3 -> μ-law@8k with gain
   const mulawBuffer = await transcodeMp3ToMulaw(mp3Buffer);
-  await paceAndSendMuLaw(ws, streamSid, mulawBuffer, { tailMs: 600 });
-  sendMark(ws, streamSid, "tts-done");
-  console.log(`TTS: sent ~${mulawBuffer.length} bytes μ-law (paced, +gain)`);
+
+  // 3) Pace frames to Twilio
+  await paceAndSendMuLaw(ws, streamSid, mulawBuffer, { tailMs: 600 }, controller);
+
+  if (!(controller && controller.cancelled)) {
+    sendMark(ws, streamSid, "tts-done");
+    console.log(`TTS: sent ~${mulawBuffer.length} bytes μ-law (paced, +gain)`);
+  } else {
+    console.log("TTS: cancelled mid-playback");
+  }
 }
 
-// ---------- Greeting cache utilities ----------
-async function transcodeMp3ToMulaw(mp3Buffer) {
+// ---------- Tone playback (debug/No-API mode) ----------
+async function startPlaybackTone({ ws, streamSid, seconds = 2, freq = 880, logPrefix = "TONE", controller = null }) {
   return new Promise((resolve, reject) => {
     const args = [
-      "-i","pipe:0",
-      "-filter:a","volume=2.0",      // +6 dB gain before μ-law
+      "-f","lavfi","-i",`sine=frequency=${freq}:duration=${seconds}`,
+      "-filter:a","volume=2.0",
       "-ar","8000","-ac","1","-f","mulaw","pipe:1"
     ];
     const p = spawn(ffmpegPath, args);
     const chunks = [];
     p.stdout.on("data", (buf) => chunks.push(buf));
+    p.stderr.on("data", () => {});
+    p.on("close", async (code) => {
+      if (code !== 0) return reject(new Error(`${logPrefix} ffmpeg exited with code ${code}`));
+      const out = Buffer.concat(chunks);
+      await paceAndSendMuLaw(ws, streamSid, out, { tailMs: 600 }, controller);
+      if (!(controller && controller.cancelled)) {
+        sendMark(ws, streamSid, `${logPrefix}-done`);
+        console.log(`${logPrefix}: sent ~${out.length} bytes μ-law (paced, +gain)`);
+      } else {
+        console.log(`${logPrefix}: cancelled mid-playback`);
+      }
+      resolve();
+    });
+    p.on("error", reject);
+  });
+}
+
+// ---------- Greeting cache utilities ----------
+let cachedGreeting = null;
+let cachedGreetingKey = null; // `${text}|${voice}|${model}`
+
+async function transcodeMp3ToMulaw(mp3Buffer) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-i","pipe:0",
+      "-filter:a","volume=2.0",
+      "-ar","8000","-ac","1","-f","mulaw","pipe:1"
+    ];
+    const p = spawn(ffmpegPath, args);
+    const chunks = [];
+    p.stdout.on("data", (buf) => chunks.push(buf));
+    p.stderr.on("data", () => {});
     p.on("close", (code) => {
       if (code !== 0) return reject(new Error(`ffmpeg exited with code ${code}`));
       resolve(Buffer.concat(chunks));
@@ -142,7 +161,6 @@ async function fetchTTSMp3({ text, voice, model }) {
   return Buffer.from(await resp.arrayBuffer());
 }
 
-// Warm the greeting cache at boot or on demand
 async function warmGreeting({ text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
   try {
     const key = `${text}|${voice}|${model}`;
@@ -162,17 +180,20 @@ async function warmGreeting({ text, voice = "alloy", model = "gpt-4o-mini-tts" }
   }
 }
 
-// Play cached greeting immediately; if not ready, fall back to live TTS
-async function playCachedGreeting({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts" }) {
+async function playCachedGreeting({ ws, streamSid, text, voice = "alloy", model = "gpt-4o-mini-tts", controller = null }) {
   const key = `${text}|${voice}|${model}`;
   if (cachedGreeting && cachedGreetingKey === key) {
-    await paceAndSendMuLaw(ws, streamSid, cachedGreeting, { tailMs: 600 });
-    sendMark(ws, streamSid, "tts-done");
-    console.log(`TTS (cached): sent ~${cachedGreeting.length} bytes μ-law (paced, +gain)`);
+    await paceAndSendMuLaw(ws, streamSid, cachedGreeting, { tailMs: 600 }, controller);
+    if (!(controller && controller.cancelled)) {
+      sendMark(ws, streamSid, "tts-done");
+      console.log(`TTS (cached): sent ~${cachedGreeting.length} bytes μ-law (paced, +gain)`);
+    } else {
+      console.log("TTS (cached): cancelled mid-playback");
+    }
     return;
   }
-  // Fallback (should be rare if warmed at boot)
-  await startPlaybackFromTTS({ ws, streamSid, text, voice, model });
+  // Fallback if cache missed
+  await startPlaybackFromTTS({ ws, streamSid, text, voice, model, controller });
 }
 
 module.exports = {
@@ -180,4 +201,5 @@ module.exports = {
   startPlaybackFromTTS,
   warmGreeting,
   playCachedGreeting,
+  TtsController,
 };
