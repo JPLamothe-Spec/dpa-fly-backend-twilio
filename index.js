@@ -1,6 +1,6 @@
-// index.js — Stable duplex: cached greeting (no early cancel), optional barge-in (OFF by default)
-// Whisper ASR → GPT (hybrid intents; phone capture feature-flagged OFF) → TTS replies
-// Dev Mode ON by default (env) and assumes caller is JP; speaks naturally to help us iterate.
+// index.js — Stable duplex: greeting (no early cancel), barge-in OFF by default
+// Whisper ASR → GPT-4o-mini (concise) → TTS (British female by default)
+// Dev Mode ON at start (assumes caller is JP). Phone capture is feature-flagged OFF.
 
 const express = require("express");
 const http = require("http");
@@ -11,7 +11,6 @@ const { spawn } = require("child_process");
 const ffmpegPath = require("ffmpeg-static") || "ffmpeg";
 require("dotenv").config();
 
-// fetch (CJS-friendly)
 const fetch = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
 
 const {
@@ -19,6 +18,7 @@ const {
   startPlaybackTone,
   warmGreeting,
   playCachedGreeting,
+  clearGreetingCache,
   TtsController,
 } = require("./tts");
 
@@ -35,15 +35,17 @@ const GREETING_TEXT =
   process.env.GREETING_TEXT ||
   "Hi, this is Anna, JP's digital personal assistant. Would you like me to pass on a message?";
 
-// Voice
-const TTS_VOICE  = process.env.TTS_VOICE  || "verse";           // British female
-const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts"; // OpenAI TTS model
+// British female voice by default (try "aria"; you can test others later)
+const TTS_VOICE  = process.env.TTS_VOICE  || "aria";
+const TTS_MODEL  = process.env.TTS_MODEL  || "gpt-4o-mini-tts";
 
 // Barge-in (kept OFF for stability)
 const BARGE_IN_ENABLED = String(process.env.BARGE_IN_ENABLED || "false").toLowerCase() === "true";
 const SPEECH_THRESH = Number(process.env.BARGE_IN_THRESH || 22);
-const HOT_FRAMES    = Number(process.env_BARGE_IN_FRAMES || process.env.BARGE_IN_FRAMES || 8); // ~160ms
-const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 500);
+const HOT_FRAMES    = Number(process.env_BARGE_IN_FRAMES || 8);
+
+// Remove extra wait before speaking for lower latency
+const SILENCE_BEFORE_REPLY_MS = Number(process.env.SILENCE_BEFORE_REPLY_MS || 0);
 
 // Greeting safety
 const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
@@ -52,26 +54,24 @@ const GREETING_SAFETY_MS = Number(process.env.GREETING_SAFETY_MS || 2800);
 const GOODBYE_GUARD_WINDOW_MS = Number(process.env.GOODBYE_GUARD_WINDOW_MS || 2500);
 const GOODBYE_MIN_TOKENS      = Number(process.env.GOODBYE_MIN_TOKENS || 4);
 
-// Dev Mode (default from env)
-const ANNA_DEV_MODE_DEFAULT = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true"; // ✅ default ON
+// Dev Mode (default ON)
+const ANNA_DEV_MODE_DEFAULT = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
 // Phone capture feature flag (default OFF)
 const PHONE_CAPTURE_ENABLED = String(process.env.PHONE_CAPTURE_ENABLED || "false").toLowerCase() === "true";
 
-// AU phone capture helpers
+// Admin token for cache flush
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+/* =========
+   Utilities
+   ========= */
 const AU_MOBILE_LEN = 10;
 const DIGIT_WORDS = {
   "zero": "0", "oh": "0", "o": "0",
-  "one": "1",
-  "two": "2",
-  "three": "3",
-  "four": "4",
-  "five": "5",
-  "six": "6",
-  "seven": "7",
-  "eight": "8",
-  "nine": "9"
+  "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+  "six": "6", "seven": "7", "eight": "8", "nine": "9"
 };
 const MULTIPLIER_WORDS = { "double": 2, "triple": 3 };
 
@@ -112,8 +112,6 @@ function userCancelsNumberMode(text = "") {
   const t = (text || "").toLowerCase();
   return /\b(not digits|stop digits|cancel number|no number|ignore number|not giving (you )?my number|i'?m not (trying to )?say digits|don'?t take my number)\b/.test(t);
 }
-
-// μ-law energy helper (optional barge-in)
 function ulawEnergy(buf) {
   let acc = 0;
   for (let i = 0; i < buf.length; i++) acc += Math.abs(buf[i] - 0x7f);
@@ -139,6 +137,18 @@ app.post("/twilio/voice", (req, res) => {
 // Health
 app.get("/", (_req, res) => res.status(200).send("DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+/* ===================
+   Admin: flush TTS cache
+   =================== */
+app.post("/admin/flush-tts-cache", (req, res) => {
+  const token = req.headers["x-admin-token"] || "";
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
+    return res.status(403).json({ ok: false, error: "forbidden" });
+  }
+  clearGreetingCache();
+  return res.json({ ok: true });
+});
 
 const server = http.createServer(app);
 
@@ -231,7 +241,7 @@ wss.on("connection", (ws) => {
             firstListenStartedAt = Date.now();
           }
         }, GREETING_SAFETY_MS);
-        break;
+               break;
 
       case "media": {
         if (data?.media?.payload) {
@@ -299,7 +309,7 @@ wss.on("connection", (ws) => {
       const mulaw = Buffer.concat(buffers);
       buffers = [];
 
-      const isLikelySilence = mulaw.length < (160 * 10); // ~200ms @ 8k μ-law
+      const isLikelySilence = mulaw.length < (160 * 10); // ~200ms
       if (isLikelySilence && collectAttempts < 2) {
         console.log("🤫 Low audio captured — extending collection window");
         return startCollectingWindow(5000);
@@ -417,7 +427,7 @@ wss.on("connection", (ws) => {
           collectAttempts = 0; return;
         }
 
-        // === Normal GPT path ===
+        // === Normal GPT path (concise) ===
         const reply = await generateReply({
           userText: transcript,
           devMode: devModeActive,
@@ -527,9 +537,9 @@ async function generateReply({ userText, devMode, knownName }) {
   const system = devMode
     ? (
       `You are Anna, JP’s Australian digital personal assistant AND a core member of the DPA build team.
-Caller is ${knownName || "JP"} (developer) on a live PHONE CALL. Speak naturally, be concise, and help improve the system.
-Offer brief diagnostics when relevant (greeting complete? any barge-in? digits captured? rough latency?). Avoid jargon unless asked.
-Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t catch that." In dev mode, prioritise helpful suggestions and next steps.`
+Caller is ${knownName || "JP"} (developer) on a live PHONE CALL. Be very concise (<= 12 words).
+Offer quick, actionable diagnostics when relevant. Avoid jargon unless asked.
+Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t catch that."`
     )
     : (
       "You are Anna, JP’s Australian digital personal assistant on a live phone call. " +
@@ -551,9 +561,9 @@ Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t c
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini", // ✅ keep GPT-4o-mini for latency
-      temperature: devMode ? 0.4 : 0.5,
-      max_tokens: 140,
+      model: "gpt-4o-mini",        // keep low-latency model
+      temperature: devMode ? 0.3 : 0.5,
+      max_tokens: 60,              // keep TTS short → faster
       messages
     }),
   });
@@ -564,7 +574,7 @@ Never say "I can’t hear you"; if transcript is empty, say "Sorry, I didn’t c
   }
   const json = await resp.json();
   const text = json.choices?.[0]?.message?.content?.trim();
-  return text || (devMode ? "Righto — what should we tweak first?" : "Got it. What would you like me to pass on to JP?");
+  return text || (devMode ? "Ready. What should we tweak first?" : "Got it. What would you like me to pass on to JP?");
 }
 
 /* ======
