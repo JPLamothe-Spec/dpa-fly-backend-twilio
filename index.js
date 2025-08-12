@@ -1,8 +1,4 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with two-way transcripts & low-latency VAD
-// - Distinguishes USER vs ASSISTANT transcripts (delta + final-ready events)
-// - No trickle commits (only on silence or max-turn) → avoids input_audio_buffer_commit_empty
-// - Slightly tighter VAD defaults to trim perceived lag
-// - Sends μ-law audio to Twilio via response.audio.delta and legacy response.output_audio.delta
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with robust session handshake & two-way transcripts
 
 const express = require("express");
 const http = require("http");
@@ -23,13 +19,13 @@ const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
 // μ-law @ 8kHz ⇒ 800 bytes ≈ 100ms
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 1000); // ~125ms (safer than 100ms)
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
-// Tighten silence a bit to reduce the “dead air” without chopping words
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 900);
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);
-// Small guard to prevent immediate re-commit thrash
 const COMMIT_DEBOUNCE_MS = 150;
+
+const INPUT_ASR_MODEL = process.env.INPUT_ASR_MODEL || "gpt-4o-transcribe-realtime-preview-2024-12-17";
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA) Project
 - Goal: natural, low-latency phone assistant for JP.
@@ -107,27 +103,23 @@ wss.on("connection", async (twilioWS, req) => {
   let mediaPackets = 0;
   let sentBytesToTwilio = 0;
 
-  let oaiReady = false;
+  let sessionReady = false; // ⟵ set TRUE only after `session.updated`
   let lastCommitAt = 0;
 
   function bufferedMs(bytes){ return Math.round((bytes / 800) * 100); } // μ-law @ 8k
   function resetBuffer(){ mulawChunks = []; bytesBuffered = 0; }
 
   function commitIfReady(cause, respond) {
+    if (!sessionReady) return; // ⟵ hard gate: don’t commit before session is configured
     const now = Date.now();
-    if (now - lastCommitAt < COMMIT_DEBOUNCE_MS) return; // debounce
+    if (now - lastCommitAt < COMMIT_DEBOUNCE_MS) return;
 
     const haveAudio = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
-    if (!oaiReady || !haveAudio) return;
+    if (!haveAudio) return;
 
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-
-    // guard: require >=100ms to satisfy API
-    if (ms < 100) {
-      // do not send any commit; just keep buffering
-      return;
-    }
+    if (ms < 100) return; // API minimum
 
     const b64 = payloadBuf.toString("base64");
     try {
@@ -159,7 +151,7 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
 
-    // IMPORTANT: enable server-side ASR for USER audio so we get response.input_audio_transcription.delta
+    // Ask for a session update, but DON'T mark ready yet.
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -168,31 +160,31 @@ ${PROJECT_BRIEF}`
         modalities: ["audio","text"],
         voice: VOICE,
         instructions,
-        input_audio_transcription: {
-          // This param was missing in your logs and caused 'missing_required_parameter'
-          model: process.env.INPUT_ASR_MODEL || "gpt-4o-transcribe-realtime-preview-2024-12-17"
-        }
+        input_audio_transcription: { model: INPUT_ASR_MODEL }
       }
     }));
-    oaiReady = true; // session.update is synchronous for our socket lifecycle
   });
-  oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
-  oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // ---- OpenAI -> Twilio + Logs ----
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // Assistant live transcript
+    // Mark session ready only when the server acks the session
+    if (msg.type === "session.updated") {
+      sessionReady = true;
+      console.log("✅ session.updated — sessionReady=true");
+      // Send greeting now that TTS + formats are active
+      try {
+        oai.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
+        }));
+      } catch {}
+      return;
+    }
+
     if (msg.type === "response.audio_transcript.delta" && msg.delta) {
       console.log("🗣️ ANNA:", String(msg.delta));
     }
-    if (msg.type === "response.output_text.delta" && msg.delta) {
-      // Text modality (optional to show)
-      // console.log("📝 ANNA TEXT:", String(msg.delta));
-    }
-
-    // USER live transcript (requires input_audio_transcription.model above)
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
       console.log("👂 USER:", String(msg.delta));
     }
@@ -201,7 +193,6 @@ ${PROJECT_BRIEF}`
     }
 
     if (streamSid) {
-      // Modern audio path
       if (msg.type === "response.audio.delta" && msg.delta) {
         const chunkB64 = msg.delta;
         try {
@@ -210,11 +201,8 @@ ${PROJECT_BRIEF}`
           if (sentBytesToTwilio < 2000 || sentBytesToTwilio % 48000 === 0) {
             console.log(`📤 sent to Twilio: ${sentBytesToTwilio} bytes total`);
           }
-        } catch (e) {
-          console.error("❌ send audio to Twilio failed:", e?.message || e);
-        }
+        } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
       }
-      // Legacy audio path
       if (msg.type === "response.output_audio.delta" && msg.audio) {
         const chunkB64 = msg.audio;
         try {
@@ -223,11 +211,8 @@ ${PROJECT_BRIEF}`
           if (sentBytesToTwilio < 2000 || sentBytesToTwilio % 48000 === 0) {
             console.log(`📤 sent to Twilio: ${sentBytesToTwilio} bytes total`);
           }
-        } catch (e) {
-          console.error("❌ send audio to Twilio failed:", e?.message || e);
-        }
+        } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
       }
-
       if (msg.type === "response.audio.done" || msg.type === "response.output_audio.done") {
         try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
       }
@@ -236,7 +221,10 @@ ${PROJECT_BRIEF}`
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
-  // ---- VAD/turn-taking: commit caller audio when it’s ready ----
+  oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
+  oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
+
+  // ---- VAD/turn-taking: commit caller audio when it’s ready (no trickle timer anywhere) ----
   const vadPoll = setInterval(() => {
     const now = Date.now();
     const longSilence = now - lastSpeechAt >= SILENCE_MS;
@@ -265,14 +253,6 @@ ${PROJECT_BRIEF}`
         sentBytesToTwilio = 0;
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
-
-        // Single concise greeting (one active response at a time)
-        try {
-          oai.send(JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
-          }));
-        } catch {}
         break;
 
       case "media": {
