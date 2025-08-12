@@ -1,4 +1,4 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), frame-aligned commits, "let me finish"
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law), strict commit guard, silence-only commits, transcript logs
 
 const express = require("express");
 const http = require("http");
@@ -10,7 +10,7 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ===== Env =====
+// ---------- Env ----------
 const PORT = process.env.PORT || 3000;
 const STREAM_WS_URL = process.env.STREAM_WS_URL || "wss://dpa-fly-backend-twilio.fly.dev/call";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -20,30 +20,24 @@ const VOICE = (process.env.VOICE || "coral").toLowerCase();
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-const PROJECT_BRIEF =
-  process.env.PROJECT_BRIEF ||
-  `Digital Personal Assistant (DPA)
-- Goal: natural phone assistant for JP.
-- Priorities: realtime voice (AU/UK female), low latency, avoid unsolicited number capture.
-- Dev mode: caller is ${DEV_CALLER_NAME}. Be concise. Flag latency/overlap issues.`;
+const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
+- Natural phone assistant for JP.
+- Priorities: UK/AU female voice, low latency, wait for caller, avoid unsolicited number capture.
+- Dev mode: caller is ${DEV_CALLER_NAME}. Keep replies concise and contextual; don't re-ask the same question.`;
 
-// ===== μ-law constants =====
-const FRAME_BYTES = 160;   // 20ms @ 8kHz μ-law
+// ---------- Audio & VAD ----------
+const FRAME_BYTES = 160;     // 20 ms @ 8kHz μ-law
 const FRAME_MS = 20;
 
-// Strict minimum to avoid "commit_empty" (5 frames = 100ms)
-const MIN_COMMIT_FRAMES = 5;
+const MIN_COMMIT_FRAMES = 5; // >=100 ms required by API
 const MIN_COMMIT_BYTES = FRAME_BYTES * MIN_COMMIT_FRAMES;
 
-// Let user finish before reply
-const VAD_SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 12);   // energy gate
-const VAD_SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 900);     // pause before we speak
-const VAD_MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 10000);  // hard cap for user turn
+const VAD_SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 12);   // 8–20 typical
+const VAD_SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 1100);    // how long to wait after user stops
+const VAD_MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 8000);   // force a commit at most every 8s
 
-// Micro streaming: keep pipe moving but never <100ms
-const MICRO_COMMIT_EVERY_MS = Number(process.env.MICRO_COMMIT_EVERY_MS || 350);
-const MAX_BUNDLE_FRAMES     = Number(process.env.MAX_BUNDLE_FRAMES || 30); // 30*20ms ≈ 600ms
-const MAX_BUNDLE_BYTES      = FRAME_BYTES * MAX_BUNDLE_FRAMES;
+// NO MICRO COMMITS: keep it simple until stable
+const TICK_MS = 40;
 
 function ulawEnergy(buf) {
   let s = 0;
@@ -51,7 +45,7 @@ function ulawEnergy(buf) {
   return s / buf.length;
 }
 
-// ===== TwiML (no twilio sdk) =====
+// ---------- TwiML ----------
 function twiml() {
   return `
 <Response>
@@ -77,7 +71,7 @@ app.get("/twilio/voice", (_req, res) => {
 app.get("/", (_req, res) => res.status(200).send("Realtime DPA backend is live"));
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// ===== Server & WS upgrade =====
+// ---------- Server / Upgrade ----------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -98,16 +92,11 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
-// ===== Bridge Twilio <-> OpenAI =====
+// ---------- Twilio <-> OpenAI Bridge ----------
 wss.on("connection", async (twilioWS, req) => {
   console.log("✅ Twilio WebSocket connected from", req.headers["x-forwarded-for"] || req.socket.remoteAddress);
-  if (!OPENAI_API_KEY) {
-    console.error("❌ OPENAI_API_KEY not set — closing");
-    try { twilioWS.close(); } catch {}
-    return;
-  }
+  if (!OPENAI_API_KEY) { console.error("❌ OPENAI_API_KEY not set — closing"); try { twilioWS.close(); } catch {}; return; }
 
-  // OpenAI Realtime WS
   const oai = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
@@ -115,65 +104,62 @@ wss.on("connection", async (twilioWS, req) => {
 
   let streamSid = null;
 
-  // Buffer as an array of chunks + total length
+  // inbound buffer (μ-law frames)
   let chunkQueue = [];
   let queuedBytes = 0;
 
+  // state
   let lastSpeechAt = Date.now();
   let turnStartedAt = Date.now();
-  let lastCommitAt = Date.now();
-
+  let lastAppendBytes = 0;              // bytes appended since last commit (strict guard)
   let mediaPackets = 0;
   let sentBytesToTwilio = 0;
 
   const bytesToMs = (bytes) => Math.round((bytes / FRAME_BYTES) * FRAME_MS);
 
-  // Helpers for frame-aligned take
-  function framesAvailable() {
-    return Math.floor(queuedBytes / FRAME_BYTES);
-  }
-  function takeBytesAligned(maxBytes) {
-    // Only return a multiple of FRAME_BYTES, up to maxBytes
-    const maxAligned = Math.floor(Math.min(queuedBytes, maxBytes) / FRAME_BYTES) * FRAME_BYTES;
-    if (maxAligned <= 0) return Buffer.alloc(0);
+  function framesAvailable() { return Math.floor(queuedBytes / FRAME_BYTES); }
 
-    let need = maxAligned;
-    const out = Buffer.allocUnsafe(maxAligned);
-    let offset = 0;
+  function takeBytesAligned(maxBytes) {
+    const takeAligned = Math.floor(Math.min(queuedBytes, maxBytes) / FRAME_BYTES) * FRAME_BYTES;
+    if (takeAligned <= 0) return Buffer.alloc(0);
+
+    let need = takeAligned;
+    const out = Buffer.allocUnsafe(takeAligned);
+    let off = 0;
 
     while (need > 0 && chunkQueue.length) {
       const head = chunkQueue[0];
       if (head.length <= need) {
-        head.copy(out, offset);
-        offset += head.length;
+        head.copy(out, off);
+        off += head.length;
         need -= head.length;
         chunkQueue.shift();
       } else {
-        // split head
-        head.copy(out, offset, 0, need);
+        head.copy(out, off, 0, need);
         chunkQueue[0] = head.subarray(need);
-        offset += need;
+        off += need;
         need = 0;
       }
     }
-    queuedBytes -= maxAligned;
+    queuedBytes -= takeAligned;
     return out;
   }
 
-  // ==== OpenAI lifecycle ====
+  // ----- OpenAI lifecycle -----
   oai.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
 
     const instructions = DEV_MODE
-      ? `You are Anna, JP’s digital personal assistant and part of the build team.
-Caller is ${DEV_CALLER_NAME}. Use a clear UK/AU female delivery with the '${VOICE}' voice.
-Wait for the caller to finish (brief pause) before replying. Keep replies concise and contextual.`
-      : `You are Anna. Be concise and wait for the caller to finish before replying.`;
+      ? `You are Anna, JP’s digital personal assistant and a member of the build team.
+Caller is ${DEV_CALLER_NAME}. Use '${VOICE}' voice (UK/AU female).
+Wait for a brief pause before replying. Do not ask the same "How can I help?" repeatedly.
+If the last user turn is short or unclear, ask a specific clarifying question instead of repeating the prompt.`
+      : `You are Anna. Wait for brief pauses before replying; avoid repeating yourself.`;
 
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
-        input_audio_format:  "g711_ulaw",   // string form per API
+        input_audio_format:  "g711_ulaw",
         output_audio_format: "g711_ulaw",
         modalities: ["audio","text"],
         voice: VOICE,
@@ -184,9 +170,15 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // OpenAI -> Twilio (audio)
+  // OpenAI -> Twilio (TTS out)
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
+    if (msg.type?.startsWith?.("response.")) {
+      // log partial transcripts to verify what Anna "heard"
+      if (msg.type === "response.audio_transcript.delta" && msg.delta) {
+        console.log("📝 heard+transcribing:", String(msg.delta).slice(0, 200));
+      }
+    }
     if (!streamSid) return;
 
     if (msg.type === "response.audio.delta" && msg.delta) {
@@ -219,50 +211,47 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
-  // ==== Commit loop (only when we appended data this tick) ====
+  // ----- Commit loop (silence-only) -----
   const tick = setInterval(() => {
     if (oai.readyState !== WebSocket.OPEN) return;
 
     const now = Date.now();
     const haveFrames = framesAvailable();
-    if (haveFrames < MIN_COMMIT_FRAMES) return; // <100ms → do nothing
+    if (haveFrames * FRAME_BYTES < MIN_COMMIT_BYTES) return;  // <100ms → don't touch
 
     const longSilence = now - lastSpeechAt >= VAD_SILENCE_MS;
-    const hitMax = now - turnStartedAt >= VAD_MAX_TURN_MS;
-    const dueMicro = now - lastCommitAt >= MICRO_COMMIT_EVERY_MS;
+    const hitMaxTurn = now - turnStartedAt >= VAD_MAX_TURN_MS;
 
-    // Amount to send this tick (frame-aligned, never less than 100ms)
-    const maxThisTick = (longSilence || hitMax) ? MAX_BUNDLE_BYTES : Math.min(MAX_BUNDLE_BYTES, queuedBytes);
-    const slice = takeBytesAligned(maxThisTick);
+    if (!longSilence && !hitMaxTurn) return;
+
+    // take as much as we have (frame-aligned)
+    const slice = takeBytesAligned(queuedBytes);
     if (slice.length < MIN_COMMIT_BYTES) {
-      // put it back if we somehow took <100ms (shouldn't happen due to guards)
-      if (slice.length) {
-        chunkQueue.unshift(slice); // revert
-        queuedBytes += slice.length;
-      }
+      // safety: put back if we somehow grabbed <100ms
+      if (slice.length) { chunkQueue.unshift(slice); queuedBytes += slice.length; }
       return;
     }
 
     try {
+      // strict guard: only commit if we appended this tick
       oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: slice.toString("base64") }));
+      lastAppendBytes = slice.length;
+
       oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      if (longSilence || hitMax) {
-        oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
-        console.log(`🔊 committed ~${bytesToMs(slice.length)}ms cause=${longSilence ? "silence" : "max"} (→ respond)`);
-        turnStartedAt = now;
-      } else if (dueMicro) {
-        console.log(`🔊 committed ~${bytesToMs(slice.length)}ms cause=micro (no respond)`);
-      } else {
-        // Not time for a micro yet → hold off; put back remaining bytes if any
-        // (We already sent a decent chunk; skipping extra log noise.)
-      }
-      lastCommitAt = now;
+      console.log(`🔊 committed ~${bytesToMs(slice.length)}ms cause=${longSilence ? "silence" : "max"} (→ respond)`);
+
+      // Immediately request a response
+      oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
+
+      // reset turn timers
+      lastAppendBytes = 0;
+      turnStartedAt = now;
     } catch (e) {
       console.error("❌ send to Realtime failed:", e?.message || e);
     }
-  }, 40);
+  }, TICK_MS);
 
-  // ==== Twilio inbound media ====
+  // ----- Twilio inbound -----
   twilioWS.on("message", (raw) => {
     let data; try { data = JSON.parse(raw.toString()); } catch { return; }
     switch (data.event) {
@@ -273,13 +262,14 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
+        // reset state
         chunkQueue = [];
         queuedBytes = 0;
         mediaPackets = 0;
         sentBytesToTwilio = 0;
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
-        lastCommitAt = Date.now();
+        lastAppendBytes = 0;
         break;
 
       case "media": {
@@ -289,10 +279,10 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
         if (mediaPackets <= 5 || mediaPackets % 50 === 0) {
           console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
         }
+        // VAD
         const e = ulawEnergy(mulaw);
         if (e > VAD_SPEECH_THRESH) lastSpeechAt = Date.now();
 
-        // enqueue
         chunkQueue.push(mulaw);
         queuedBytes += mulaw.length;
         break;
@@ -304,7 +294,6 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
         break;
 
       default:
-        // ignore marks, etc.
         break;
     }
   });
@@ -319,7 +308,7 @@ Wait for the caller to finish (brief pause) before replying. Keep replies concis
   }
 });
 
-// ===== Start =====
+// ---------- Start ----------
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Realtime DPA listening on 0.0.0.0:${PORT}`);
 });
