@@ -1,9 +1,8 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with faster turns + full transcripts
-// - Distinguishes USER vs ASSISTANT transcripts in logs
-// - Trickle-commits while speaking (lowers perceived latency)
-// - Shorter silence VAD + hard cap; still lets caller finish
-// - Guards against input_audio_buffer_commit_empty + overlapping responses
-// - Sends μ-law audio to Twilio via response.audio.delta (primary) and legacy output_audio
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with two-way transcripts & low-latency VAD
+// - Distinguishes USER vs ASSISTANT transcripts (delta + final-ready events)
+// - No trickle commits (only on silence or max-turn) → avoids input_audio_buffer_commit_empty
+// - Slightly tighter VAD defaults to trim perceived lag
+// - Sends μ-law audio to Twilio via response.audio.delta and legacy response.output_audio.delta
 
 const express = require("express");
 const http = require("http");
@@ -24,13 +23,13 @@ const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
 // μ-law @ 8kHz ⇒ 800 bytes ≈ 100ms
-// Commit earlier to reduce lag (min ~120ms) but *never* below 100ms.
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 960); // ≈120ms
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 22);
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 650); // was 1200 → snappier
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 4000); // hard cap while speaking
-const TRICKLE_EVERY_MS = Number(process.env.TRICKLE_MS || 320);    // steady trickle while speaking
-const COMMIT_DEBOUNCE_MS = 120;
+// Tighten silence a bit to reduce the “dead air” without chopping words
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 900);
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 6000);
+// Small guard to prevent immediate re-commit thrash
+const COMMIT_DEBOUNCE_MS = 150;
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA) Project
 - Goal: natural, low-latency phone assistant for JP.
@@ -103,41 +102,38 @@ wss.on("connection", async (twilioWS, req) => {
   let streamSid = null;
   let mulawChunks = [];
   let bytesBuffered = 0;
-
   let lastSpeechAt = Date.now();
   let turnStartedAt = Date.now();
-  let lastCommitAt = 0;
-  let lastTrickleAt = 0;
-
   let mediaPackets = 0;
   let sentBytesToTwilio = 0;
-  let oaiReady = false;
 
-  // Prevent overlapping responses
-  let responseInFlight = false;
+  let oaiReady = false;
+  let lastCommitAt = 0;
 
   function bufferedMs(bytes){ return Math.round((bytes / 800) * 100); } // μ-law @ 8k
   function resetBuffer(){ mulawChunks = []; bytesBuffered = 0; }
 
-  function haveEnoughToCommit() {
-    return bytesBuffered >= Math.max(800, MIN_COMMIT_BYTES) && mulawChunks.length > 0; // >=100ms
-  }
-
-  function commit(cause, respond) {
+  function commitIfReady(cause, respond) {
     const now = Date.now();
-    if (now - lastCommitAt < COMMIT_DEBOUNCE_MS) return;
-    if (!oaiReady || !haveEnoughToCommit()) return;
+    if (now - lastCommitAt < COMMIT_DEBOUNCE_MS) return; // debounce
+
+    const haveAudio = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
+    if (!oaiReady || !haveAudio) return;
 
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 100) return; // safety (keep buffer; do not drop)
+
+    // guard: require >=100ms to satisfy API
+    if (ms < 100) {
+      // do not send any commit; just keep buffering
+      return;
+    }
 
     const b64 = payloadBuf.toString("base64");
     try {
       oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      if (respond && !responseInFlight) {
-        responseInFlight = true;
+      if (respond) {
         oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
         console.log(`🔊 committed ~${ms}ms cause=${cause} (→ respond)`);
       } else {
@@ -149,29 +145,21 @@ wss.on("connection", async (twilioWS, req) => {
       resetBuffer();
       turnStartedAt = now;
       lastCommitAt = now;
-      lastTrickleAt = now;
     }
-  }
-
-  function trickleWhileSpeaking(now) {
-    // steady “drip” while voice energy is present to reduce end-to-first-token delay
-    if (!haveEnoughToCommit()) return;
-    if (now - lastTrickleAt < TRICKLE_EVERY_MS) return;
-    commit("trickle", /*respond*/ false);
   }
 
   oai.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
+
     const instructions = DEV_MODE
       ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
 Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless requested.
 
 PROJECT BRIEF:
-${PROJECT_BRIEF}
-Turn-taking: let the caller finish. Do not interrupt.`
-      : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful. Wait until the caller finishes.`;
+${PROJECT_BRIEF}`
+      : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
 
-    // Enable server VAD and input transcription stream
+    // IMPORTANT: enable server-side ASR for USER audio so we get response.input_audio_transcription.delta
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -180,11 +168,13 @@ Turn-taking: let the caller finish. Do not interrupt.`
         modalities: ["audio","text"],
         voice: VOICE,
         instructions,
-        turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: SILENCE_MS },
-        input_audio_transcription: { enabled: true } // surfaces response.input_audio_transcription.delta
+        input_audio_transcription: {
+          // This param was missing in your logs and caused 'missing_required_parameter'
+          model: process.env.INPUT_ASR_MODEL || "gpt-4o-transcribe-realtime-preview-2024-12-17"
+        }
       }
     }));
-    oaiReady = true;
+    oaiReady = true; // session.update is synchronous for our socket lifecycle
   });
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
@@ -193,24 +183,25 @@ Turn-taking: let the caller finish. Do not interrupt.`
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // ASSISTANT live text/audio
+    // Assistant live transcript
     if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-      console.log("🗣️ ANNA SAID:", String(msg.delta));
+      console.log("🗣️ ANNA:", String(msg.delta));
     }
     if (msg.type === "response.output_text.delta" && msg.delta) {
+      // Text modality (optional to show)
       // console.log("📝 ANNA TEXT:", String(msg.delta));
     }
 
-    // USER live transcript (from input audio)
+    // USER live transcript (requires input_audio_transcription.model above)
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
-      console.log("👂 YOU SAID:", String(msg.delta));
+      console.log("👂 USER:", String(msg.delta));
     }
     if (msg.type === "response.input_text.delta" && msg.delta) {
-      console.log("👂 YOU SAID (text):", String(msg.delta));
+      console.log("👂 USER (text):", String(msg.delta));
     }
 
-    // stream μ-law back to Twilio
     if (streamSid) {
+      // Modern audio path
       if (msg.type === "response.audio.delta" && msg.delta) {
         const chunkB64 = msg.delta;
         try {
@@ -223,7 +214,7 @@ Turn-taking: let the caller finish. Do not interrupt.`
           console.error("❌ send audio to Twilio failed:", e?.message || e);
         }
       }
-      // Legacy stream shape (some builds emit this)
+      // Legacy audio path
       if (msg.type === "response.output_audio.delta" && msg.audio) {
         const chunkB64 = msg.audio;
         try {
@@ -233,7 +224,7 @@ Turn-taking: let the caller finish. Do not interrupt.`
             console.log(`📤 sent to Twilio: ${sentBytesToTwilio} bytes total`);
           }
         } catch (e) {
-          console.error("❌ send audio to Twilio failed (legacy):", e?.message || e);
+          console.error("❌ send audio to Twilio failed:", e?.message || e);
         }
       }
 
@@ -242,15 +233,7 @@ Turn-taking: let the caller finish. Do not interrupt.`
       }
     }
 
-    if (msg.type === "response.completed" || msg.type === "response.cancelled") {
-      responseInFlight = false;
-    }
-
-    if (msg.type === "error") {
-      console.error("🔻 OAI error:", msg);
-      // allow next response attempt if the current one faulted
-      responseInFlight = false;
-    }
+    if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
   // ---- VAD/turn-taking: commit caller audio when it’s ready ----
@@ -258,17 +241,13 @@ Turn-taking: let the caller finish. Do not interrupt.`
     const now = Date.now();
     const longSilence = now - lastSpeechAt >= SILENCE_MS;
     const hitMax = now - turnStartedAt >= MAX_TURN_MS;
+    const haveAudio = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
 
-    if (haveEnoughToCommit()) {
-      if (longSilence || hitMax) {
-        // On end of thought / max turn, ask model to answer.
-        commit(longSilence ? "silence" : "max", /*respond*/ true);
-      } else {
-        // While speaking, send small trickles (no respond) to prime decoding.
-        trickleWhileSpeaking(now);
-      }
+    if ((longSilence || hitMax) && haveAudio) {
+      const cause = hitMax ? "max" : "silence";
+      commitIfReady(cause, /*respond*/ true);
     }
-  }, 40);
+  }, 50);
 
   // Twilio inbound media
   twilioWS.on("message", (raw) => {
@@ -281,25 +260,19 @@ Turn-taking: let the caller finish. Do not interrupt.`
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
-        mulawChunks = [];
-        bytesBuffered = 0;
+        resetBuffer();
         mediaPackets = 0;
         sentBytesToTwilio = 0;
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
-        lastCommitAt = 0;
-        lastTrickleAt = 0;
 
-        // Single concise greeting (only if nothing is already in-flight)
-        if (!responseInFlight) {
-          responseInFlight = true;
-          try {
-            oai.send(JSON.stringify({
-              type: "response.create",
-              response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
-            }));
-          } catch { responseInFlight = false; }
-        }
+        // Single concise greeting (one active response at a time)
+        try {
+          oai.send(JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
+          }));
+        } catch {}
         break;
 
       case "media": {
