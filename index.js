@@ -1,8 +1,4 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with paced audio-out
-// - Uses CommonJS (no ESM/import headaches on Node 18).
-// - Voice set to "coral" (valid).
-// - Explicit 8k g711_ulaw in/out.
-// - Frames & throttles outbound audio to Twilio (20ms/160B) for reliable playback.
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with paced audio-out (fixed formats)
 
 const express = require("express");
 const http = require("http");
@@ -22,7 +18,7 @@ const STREAM_WS_URL =
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
-// Valid voices per API: alloy, ash, ballad, coral, echo, sage, shimmer, verse
+// Valid voices: alloy, ash, ballad, coral, echo, sage, shimmer, verse
 const VOICE = (process.env.VOICE || "coral").toLowerCase();
 
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
@@ -117,6 +113,7 @@ wss.on("connection", async (twilioWS, req) => {
   // Outbound (OAI→Twilio) pacing queue (160B / 20ms)
   let ttsQueue = [];
   let ttsTimer = null;
+  let carry = Buffer.alloc(0); // hold partial frames across deltas
   let sentBytesToTwilio = 0;
 
   function startPacer(){
@@ -140,10 +137,13 @@ wss.on("connection", async (twilioWS, req) => {
   }
 
   function enqueueForTwilio(base64Ulaw){
-    const buf = Buffer.from(base64Ulaw, "base64");
-    // slice into 160B frames (20ms @ 8k μ-law)
-    for (let i = 0; i < buf.length; i += FRAME_BYTES) {
-      ttsQueue.push(buf.slice(i, i + FRAME_BYTES));
+    const incoming = Buffer.from(base64Ulaw, "base64");
+    const buf = carry.length ? Buffer.concat([carry, incoming]) : incoming;
+    const fullFramesLen = Math.floor(buf.length / FRAME_BYTES) * FRAME_BYTES;
+    const frames = buf.subarray(0, fullFramesLen);
+    carry = buf.subarray(fullFramesLen); // keep remainder for next delta
+    for (let i = 0; i < frames.length; i += FRAME_BYTES) {
+      ttsQueue.push(frames.subarray(i, i + FRAME_BYTES));
     }
     startPacer();
   }
@@ -158,21 +158,21 @@ If the caller pauses, finish your sentence and stop. Avoid asking for phone numb
 
 PROJECT BRIEF:
 ${PROJECT_BRIEF}`
-      : `You are Anna, a friendly Australian voice assistant. Speak with a natural Australian accent and keep responses concise.`;
+      : `You are Anna, a friendly Australian voice assistant. Keep responses concise.`;
 
-    // Explicit 8k μ-law in/out
+    // IMPORTANT: formats as string literals, not objects
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
-        input_audio_format:  { type: "g711_ulaw", sample_rate: 8000 },
-        output_audio_format: { type: "g711_ulaw", sample_rate: 8000 },
+        input_audio_format:  "g711_ulaw",
+        output_audio_format: "g711_ulaw",
         modalities: ["audio","text"],
         voice: VOICE,
-        // lightweight VAD from the server side policy (we still do commit logic here)
+        instructions
       }
     }));
 
-    // Optional tiny greeting (kept short)
+    // Tiny greeting
     try {
       oai.send(JSON.stringify({
         type: "response.create",
@@ -184,13 +184,9 @@ ${PROJECT_BRIEF}`
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // ---- OpenAI -> Twilio audio (handle modern + older event shapes) ----
+  // ---- OpenAI -> Twilio audio (modern + older event shapes) ----
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
-
-    if (msg.type?.startsWith("response.")) {
-      // console.log("🧠 OAI:", msg.type);
-    }
 
     if (!streamSid) return;
 
@@ -206,11 +202,6 @@ ${PROJECT_BRIEF}`
 
     if (msg.type === "response.audio.done" || msg.type === "response.output_audio.done") {
       try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
-    }
-
-    if (msg.type === "response.output_text.delta" && msg.delta) {
-      // Helpful while testing barge-in/latency
-      // console.log("📝 text.delta:", String(msg.delta).slice(0, 200));
     }
 
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
@@ -258,9 +249,10 @@ ${PROJECT_BRIEF}`
         bytesBuffered = 0;
         mediaPackets = 0;
         sentBytesToTwilio = 0;
+        carry = Buffer.alloc(0);
         lastSpeechAt = Date.now();
         turnStartedAt = Date.now();
-        // Send a short greeting (second try in case the first fired too early)
+        // Backup greeting
         try {
           oai.send(JSON.stringify({
             type: "response.create",
