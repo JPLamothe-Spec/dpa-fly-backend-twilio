@@ -2,12 +2,15 @@
 // Minimal Twilio -> OpenAI Realtime bridge with AU1 awareness + safer audio commits.
 
 require('dotenv').config(); // safe for local; harmless on Fly
-import express from 'express';
-import bodyParser from 'body-parser';
-import crypto from 'crypto';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import twilio from 'twilio';
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const crypto = require('crypto');
+const http = require('http');
+const twilio = require('twilio');
+
+const WebSocket = require('ws');
+const { WebSocketServer } = WebSocket;
 
 const {
   PORT = 8080,
@@ -56,15 +59,11 @@ app.post('/twilio/voice', (req, res) => {
 
   const response = new twilio.twiml.VoiceResponse();
 
-  // NOTE: Twilio chooses the edge/region; we *log* it above. You can also
-  // choose an AU number or account routing set to AU1 in Console.
   const connect = response.connect();
   // Track only inbound audio from caller to avoid loopback/echo.
   connect.stream({
     url: `wss://${new URL(PUBLIC_URL).host}/call`,
     track: 'inbound_track',
-    // You can optionally pass params that we’ll read on the backend:
-    // name: `dpa-${TWILIO_REGION}`,
   });
 
   // Keep the call open while the WS is active
@@ -106,7 +105,7 @@ wss.on('connection', async (twilioWS, req) => {
 
   // Connect to OpenAI Realtime via WS
   const oaiURL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(OPENAI_REALTIME_MODEL);
-  const oaiWS = new (await import('ws')).default(oaiURL, {
+  const oaiWS = new WebSocket(oaiURL, undefined, {
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
       'OpenAI-Beta': 'realtime=v1',
@@ -125,7 +124,7 @@ wss.on('connection', async (twilioWS, req) => {
 
   // Envelope helpers
   const sendOAI = (event) => {
-    if (oaiOpen && oaiWS.readyState === oaiWS.OPEN) {
+    if (oaiOpen && oaiWS.readyState === WebSocket.OPEN) {
       oaiWS.send(JSON.stringify(event));
     }
   };
@@ -138,7 +137,6 @@ wss.on('connection', async (twilioWS, req) => {
     sendOAI({
       type: 'session.update',
       session: {
-        // Choose the TTS voice and some polite turn-taking
         voice: VOICE,
         modalities: ['audio'],
         input_audio_format: { type: 'g711_ulaw', sample_rate: 8000 }, // we feed Twilio μ-law frames
