@@ -1,4 +1,4 @@
-// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with paced audio-out (fixed formats)
+// index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law) with fast turn-taking
 
 const express = require("express");
 const http = require("http");
@@ -31,8 +31,8 @@ const FRAME_MS = 20;
 // Commit policy (caller → OpenAI)
 const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800); // ~100ms
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 12);
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 700);
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 15000);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 400);   // was 700
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 2500); // was 15000
 
 // Optional brief for dev mode
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA) Project
@@ -108,6 +108,8 @@ wss.on("connection", async (twilioWS, req) => {
   let bytesBuffered = 0;
   let lastSpeechAt = Date.now();
   let turnStartedAt = Date.now();
+  let lastCommitAt = 0;
+  let appendedSinceCommit = false; // anti-commit-empty
   let mediaPackets = 0;
 
   // Outbound (OAI→Twilio) pacing queue (160B / 20ms)
@@ -160,7 +162,6 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are Anna, a friendly Australian voice assistant. Keep responses concise.`;
 
-    // IMPORTANT: formats as string literals, not objects
     oai.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -172,7 +173,7 @@ ${PROJECT_BRIEF}`
       }
     }));
 
-    // Tiny greeting
+    // Short greeting so they hear something immediately
     try {
       oai.send(JSON.stringify({
         type: "response.create",
@@ -184,37 +185,36 @@ ${PROJECT_BRIEF}`
   oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
-  // ---- OpenAI -> Twilio audio (modern + older event shapes) ----
+  // ---- OpenAI -> Twilio audio ----
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
-
     if (!streamSid) return;
 
-    // Modern: response.audio.delta → msg.delta
     if (msg.type === "response.audio.delta" && msg.delta) {
       enqueueForTwilio(msg.delta);
     }
-
-    // Older: response.output_audio.delta → msg.audio
     if (msg.type === "response.output_audio.delta" && msg.audio) {
       enqueueForTwilio(msg.audio);
     }
-
     if (msg.type === "response.audio.done" || msg.type === "response.output_audio.done") {
       try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
     }
-
     if (msg.type === "error") console.error("🔻 OAI error:", msg);
   });
 
-  // ---- Caller → OpenAI commit logic (simple VAD-ish) ----
+  // ---- Caller → OpenAI commit logic (fast) ----
   const vadPoll = setInterval(() => {
     const now = Date.now();
     const longSilence = now - lastSpeechAt >= SILENCE_MS;
     const hitMax = now - turnStartedAt >= MAX_TURN_MS;
-    const haveAudio = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
+    const timeSinceCommit = now - lastCommitAt;
 
-    if ((longSilence || hitMax) && haveAudio) {
+    // Commit as soon as we have >=100ms, and either we’ve paused
+    // or it’s been ~350ms since last commit (keeps the model responsive)
+    const have100ms = bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
+    const shouldMicroCommit = have100ms && timeSinceCommit >= 350;
+
+    if ((have100ms && (longSilence || hitMax || shouldMicroCommit)) && appendedSinceCommit) {
       const payloadBuf = Buffer.concat(mulawChunks);
       const b64 = payloadBuf.toString("base64");
       const ms = Math.round((payloadBuf.length / FRAME_BYTES) * FRAME_MS);
@@ -227,10 +227,12 @@ ${PROJECT_BRIEF}`
       } catch (e) {
         console.error("❌ send to Realtime failed:", e?.message || e);
       }
-      // reset after logging
+      // reset
       mulawChunks = [];
       bytesBuffered = 0;
-      turnStartedAt = Date.now();
+      appendedSinceCommit = false;
+      lastCommitAt = now;
+      turnStartedAt = now;
     }
   }, 50);
 
@@ -251,14 +253,9 @@ ${PROJECT_BRIEF}`
         sentBytesToTwilio = 0;
         carry = Buffer.alloc(0);
         lastSpeechAt = Date.now();
+        lastCommitAt = 0;
+        appendedSinceCommit = true; // allow first commit
         turnStartedAt = Date.now();
-        // Backup greeting
-        try {
-          oai.send(JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio","text"], instructions: "Hi! How can I help?" }
-          }));
-        } catch {}
         break;
 
       case "media": {
@@ -270,6 +267,7 @@ ${PROJECT_BRIEF}`
         if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
         mulawChunks.push(mulaw);
         bytesBuffered += mulaw.length;
+        appendedSinceCommit = true;
         break;
       }
 
