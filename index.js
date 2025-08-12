@@ -1,7 +1,7 @@
 // index.js
 // Minimal Twilio -> OpenAI Realtime bridge with AU1 awareness + safer audio commits.
 
-import 'dotenv/config';
+require('dotenv').config(); // safe for local; harmless on Fly
 import express from 'express';
 import bodyParser from 'body-parser';
 import crypto from 'crypto';
