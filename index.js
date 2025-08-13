@@ -1,9 +1,6 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law)
-// Baseline + surgical stability fixes:
-// - No-empty-commit fuse (watermarking new audio)
-// - Longer trickle cadence & cooldown
-// - Higher min-bytes & hard ms floor
-// - Same behavior otherwise (ASR trickle always on, pause commits, transcripts)
+// Stable: ASR trickle (safer), faster pause commits, full transcripts.
+// Fixes: stricter commit gating, no trickle during TTS, cooldown after empty-commit errors.
 
 const express = require("express");
 const http = require("http");
@@ -26,19 +23,20 @@ const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
 // μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
-const DEFAULT_MIN_COMMIT_BYTES = 1600; // ≈200ms floor (raised from 800)
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || DEFAULT_MIN_COMMIT_BYTES);
-const MIN_COMMIT_MS_HARD = 140; // never commit <140ms even if bytes suggest otherwise
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 
-// ---- VAD knobs (tunable via env) — unchanged defaults, just exposed
+// ---- VAD knobs (tunable via env)
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
 const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);
 
-// ---- ASR “trickle” (always on) to surface 👂 YOU SAID continuously (no model reply)
-// Cadence & cooldown relaxed to avoid double-commit races seen in logs
-const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 900); // was 600
-const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 800); // was 300
+// ---- ASR “trickle” (safer cadence)
+// Only trickle when we have ≥~150ms new audio & TTS not active.
+const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 800);
+const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
+
+// Empty-commit cooloff (prevents rapid-fire zero buffers)
+const EMPTY_COMMIT_BACKOFF_MS = Number(process.env.EMPTY_COMMIT_BACKOFF_MS || 300);
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
 - Goal: natural, low-latency phone assistant for JP.
@@ -121,6 +119,8 @@ wss.on("connection", async (twilioWS, req) => {
   let streamSid = null;
   let mulawChunks = [];
   let bytesBuffered = 0;
+  let uncommittedBytes = 0; // NEW: track since last commit
+
   let lastSpeechAt = Date.now();
   let turnStartedAt = Date.now();
   let mediaPackets = 0;
@@ -133,52 +133,49 @@ wss.on("connection", async (twilioWS, req) => {
 
   // Commit guards
   let lastCommitAt = 0;
-  let commitInflight = false;
+  let lastNonEmptyCommitAt = 0; // NEW: for timing check
   let lastTrickleAt = 0;
+  let commitInflight = false;
+  let commitGuardUntil = 0;     // NEW: short guard window
+  let emptyCommitCooldownUntil = 0; // NEW: backoff after empty-commit error
 
   // Transcript accumulators
   let callerText = "";
   let assistantText = "";
 
-  // NEW: watermark counters to prevent empty commits
-  let totalAppendedBytes = 0; // ever-increasing since stream start
-  let lastCommittedBytes = 0; // watermark snapshot at last successful commit
-
-  const resetBuffer = () => { mulawChunks = []; bytesBuffered = 0; };
+  const resetBuffer = () => { mulawChunks = []; bytesBuffered = 0; uncommittedBytes = 0; };
   const nowMs = () => Date.now();
   const bufferedMs = (bytes) => Math.round((bytes / 800) * 100); // μ-law @8k
 
   function canCommit() {
     if (!socketOpen || !sessionHealthy || sessionError) return false;
     if (commitInflight) return false;
+    if (nowMs() < commitGuardUntil) return false;
     if (nowMs() - lastCommitAt < COMMIT_COOLDOWN_MS) return false;
-
-    // No-new-audio fuse: block commit if nothing has been appended since last commit
-    if (totalAppendedBytes <= lastCommittedBytes) return false;
-
-    if (bytesBuffered < MIN_COMMIT_BYTES) return false;
-    if (mulawChunks.length === 0) return false;
-    return true;
+    if (nowMs() < emptyCommitCooldownUntil) return false;
+    return bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
   }
 
   function doCommit({ respond, cause }) {
-    if (!canCommit()) return;
+    // Hard prechecks
+    if (!canCommit()) return false;
 
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < MIN_COMMIT_MS_HARD) {
-      // Too short — skip silently to avoid server-side rounding to <100ms
-      return;
-    }
 
-    const b64 = payloadBuf.toString("base64");
+    // Extra safety: size + elapsed since last non-empty commit
+    const elapsedSinceLast = nowMs() - lastNonEmptyCommitAt;
+    if (ms < 100) return false;              // API minimum ~100ms
+    if (elapsedSinceLast < 120) return false; // avoid back-to-back
+
+    // Lock & guard
     commitInflight = true;
+    commitGuardUntil = nowMs() + 60; // small guard to avoid same-tick reentry
     lastCommitAt = nowMs();
 
     try {
+      const b64 = payloadBuf.toString("base64");
       oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      // Advance watermark *just before* commit; if commit fails we attempt to roll back
-      lastCommittedBytes = totalAppendedBytes;
       oai.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
 
       if (respond && !activeResponse) {
@@ -194,21 +191,34 @@ wss.on("connection", async (twilioWS, req) => {
         console.log("👂 YOU (turn):", callerText.trim());
         callerText = "";
       }
+
+      lastNonEmptyCommitAt = nowMs();
+      // After commit, the data we had is now "committed"
+      uncommittedBytes = 0;
+      return true;
     } catch (e) {
       console.error("❌ send to Realtime failed:", e?.message || e);
-      // Best-effort rollback of watermark to allow future commit
-      lastCommittedBytes = Math.max(0, lastCommittedBytes - payloadBuf.length);
+      return false;
     } finally {
       commitInflight = false;
-      resetBuffer();
+      // Don't immediately nuke the buffer before server ingests — but our pattern
+      // has worked fine to reset here because we only append new frames after this tick.
+      mulawChunks = [];
+      bytesBuffered = 0;
       turnStartedAt = nowMs();
     }
   }
 
   function commitTrickle() {
-    // ASR-only trickle so we always get 👂 YOU SAID deltas, even while Anna is speaking
-    if (!canCommit()) return;
+    // No trickling while assistant is speaking (prevents races)
+    if (activeResponse) return;
+
+    // Require meaningful NEW audio since last commit: ~150ms (>=1200 bytes)
+    if (uncommittedBytes < 1200) return;
+
+    // Cadence guard
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
+
     lastTrickleAt = nowMs();
     doCommit({ respond: false, cause: "trickle" });
   }
@@ -276,11 +286,15 @@ ${PROJECT_BRIEF}`
 
     if (msg.type === "error") {
       console.error("🔻 OAI error:", msg);
+      const code = msg?.error?.code || "";
       const p = msg?.error?.param || "";
-      if (String(p).startsWith("session.") || ["invalid_value","missing_required_parameter"].includes(msg?.error?.code)) {
+      if (String(p).startsWith("session.") || ["invalid_value","missing_required_parameter"].includes(code)) {
         sessionError = true;
       }
-      // We don't close on input_audio_buffer_commit_empty anymore; watermark guard should prevent it.
+      // Backoff when we hit empty-commit so buffer can actually build
+      if (code === "input_audio_buffer_commit_empty") {
+        emptyCommitCooldownUntil = nowMs() + EMPTY_COMMIT_BACKOFF_MS;
+      }
       return;
     }
 
@@ -370,24 +384,23 @@ ${PROJECT_BRIEF}`
         lastSpeechAt = nowMs();
         turnStartedAt = nowMs();
         lastCommitAt = 0;
+        lastNonEmptyCommitAt = 0;
         lastTrickleAt = 0;
+        emptyCommitCooldownUntil = 0;
         callerText = "";
         assistantText = "";
-        // reset watermarks
-        totalAppendedBytes = 0;
-        lastCommittedBytes = 0;
         break;
 
       case "media": {
         const b64 = data?.media?.payload; if (!b64) break;
-        const mulaw = Buffer.from(b64, "base64");  // μ-law 8k, 160B ≈ 20ms
+        const mulaw = Buffer.from(b64, "base64");  // μ-law 8k
         mediaPackets += 1;
         if (mediaPackets <= 5 || mediaPackets % 50 === 0) console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
         const e = ulawEnergy(mulaw);
         if (e > SPEECH_THRESH) lastSpeechAt = nowMs();
         mulawChunks.push(mulaw);
         bytesBuffered += mulaw.length;
-        totalAppendedBytes += mulaw.length; // NEW: mark new audio since last commit
+        uncommittedBytes += mulaw.length; // NEW: track for trickle threshold
         break;
       }
 
