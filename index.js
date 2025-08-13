@@ -3,7 +3,7 @@
 // • Env-driven persona (name/role/tone/style/greeting)
 // • Private live transcription via SSE at /live and viewer at /transcript (token + dev-mode)
 // • ASR trickle, VAD-based turn-taking, low-latency tweaks
-// • Caller transcript fix for non-prefixed event
+// • Caller transcript fixes for non-prefixed and completed events
 
 const express = require("express");
 const http = require("http");
@@ -345,7 +345,7 @@ ${PROJECT_BRIEF}`
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // Debug peek for transcription-ish events
+    // Debug peek for transcription-ish events (helps surface new shapes)
     if (msg?.type && (msg.type.includes("transcript") || msg.type.includes("input_audio") || msg.type.includes("input_text"))) {
       console.log("🔎 OAI event:", msg.type);
     }
@@ -385,7 +385,7 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Caller transcripts (after each commit)
+    // Caller transcripts (common)
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
       const d = String(msg.delta);
       callerText += d;
@@ -400,12 +400,33 @@ ${PROJECT_BRIEF}`
       sseBroadcast("you_delta", { text: d });
       return;
     }
-    // Non-prefixed caller delta (some runtimes)
+
+    // --- EXTRA HANDLERS: alternate shapes seen in some runtimes ---
+
+    // Non-prefixed delta
     if (msg.type === "input_audio_transcription.delta" && msg.delta) {
       const d = String(msg.delta);
       callerText += d;
-      console.log("👂 YOU SAID (np):", d);
+      console.log("👂 YOU SAID (np.delta):", d);
       sseBroadcast("you_delta", { text: d });
+      return;
+    }
+
+    // Completed events with full transcript
+    if (msg.type === "response.input_audio_transcription.completed" && msg.transcript) {
+      const t = String(msg.transcript);
+      callerText += t;
+      console.log("👂 YOU SAID (completed):", t);
+      sseBroadcast("you_delta", { text: t });
+      sseBroadcast("you_turn", { text: t });
+      return;
+    }
+    if (msg.type === "input_audio_transcription.completed" && msg.transcript) {
+      const t = String(msg.transcript);
+      callerText += t;
+      console.log("👂 YOU SAID (np.completed):", t);
+      sseBroadcast("you_delta", { text: t });
+      sseBroadcast("you_turn", { text: t });
       return;
     }
 
