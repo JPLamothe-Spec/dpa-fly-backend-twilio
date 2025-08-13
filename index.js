@@ -1,6 +1,6 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law)
-// Incremental: ASR trickle (always on), faster pause commits, commit cooldown, full transcripts.
-// This version restores the last known-good latency behavior and adds guards against empty commits.
+// Baseline with ASR trickle, snappy VAD, full transcripts.
+// FIX: Forward BOTH response.audio.delta and response.output_audio.delta to Twilio (deduped).
 
 const express = require("express");
 const http = require("http");
@@ -22,17 +22,18 @@ const TRANSCRIBE_MODEL = ALLOWED_ASR.has(TRANSCRIBE_MODEL_RAW) ? TRANSCRIBE_MODE
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum). Give margin (>100ms).
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 960); // ~120ms
+// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
+// Use ~120ms to be safe.
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 960);
 
-// ---- VAD knobs (tunable via env)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise to ignore room noise
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);     // pause detection
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // snappy max turn (good baseline)
+// ---- VAD knobs
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);
 
-// ---- ASR “trickle” (always on) to surface 👂 YOU SAID continuously (no model reply)
-const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 900); // slightly slower to avoid races
-const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 450); // debounce duplicate commits
+// ---- ASR “trickle”
+const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600);
+const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
 - Goal: natural, low-latency phone assistant for JP.
@@ -135,6 +136,9 @@ wss.on("connection", async (twilioWS, req) => {
   let callerText = "";
   let assistantText = "";
 
+  // Audio dedupe guard (avoid double-playing if both channels arrive)
+  let lastAudioHash = "";
+
   const resetBuffer = () => { mulawChunks = []; bytesBuffered = 0; };
   const resetSinceCommit = () => { bytesSinceLastCommit = 0; };
   const nowMs = () => Date.now();
@@ -144,7 +148,6 @@ wss.on("connection", async (twilioWS, req) => {
     if (!socketOpen || !sessionHealthy || sessionError) return false;
     if (commitInflight) return false;
     if (nowMs() - lastCommitAt < COMMIT_COOLDOWN_MS) return false;
-    // Require >= MIN_COMMIT_BYTES in total AND since the last commit to avoid empty-commit races
     return (bytesBuffered >= MIN_COMMIT_BYTES) &&
            (bytesSinceLastCommit >= MIN_COMMIT_BYTES) &&
            (mulawChunks.length > 0);
@@ -155,7 +158,7 @@ wss.on("connection", async (twilioWS, req) => {
 
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 120) return; // sanity check aligned with MIN_COMMIT_BYTES guard
+    if (ms < 120) return; // extra safety
 
     const b64 = payloadBuf.toString("base64");
     commitInflight = true;
@@ -173,7 +176,6 @@ wss.on("connection", async (twilioWS, req) => {
         console.log(`🔊 committed ~${ms}ms cause=${cause} (no respond)`);
       }
 
-      // On a turn commit, flush caller turn summary line
       if (respond && callerText.trim()) {
         console.log("👂 YOU (turn):", callerText.trim());
         callerText = "";
@@ -189,7 +191,6 @@ wss.on("connection", async (twilioWS, req) => {
   }
 
   function commitTrickle() {
-    // ASR-only trickle so we always get 👂 YOU SAID deltas, even while Anna is speaking
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
     if (!canCommit()) return;
     lastTrickleAt = nowMs();
@@ -235,7 +236,7 @@ ${PROJECT_BRIEF}`
             type: "response.create",
             response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
           }));
-          activeResponse = true; // optimistic until response.created arrives
+          activeResponse = true;
         } catch (e) {
           console.error("❌ greeting send failed:", e?.message || e);
         }
@@ -266,11 +267,10 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Response lifecycle (prevents duplicate response.create)
+    // Response lifecycle
     if (msg.type === "response.created") { activeResponse = true; return; }
     if (msg.type === "response.completed" || msg.type === "response.output_audio.done" || msg.type === "response.refusal.delta") {
       activeResponse = false;
-      // Flush assistant turn summary line
       if (assistantText.trim()) console.log("🗣️ ANNA (turn):", assistantText.trim());
       assistantText = "";
       return;
@@ -283,7 +283,7 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Caller transcripts (arrive after each commit)
+    // Caller transcripts
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
       callerText += String(msg.delta);
       console.log("👂 YOU SAID:", String(msg.delta));
@@ -295,19 +295,31 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Forward assistant audio to Twilio (μ-law already, thanks to output_audio_format)
-    if (streamSid) {
-      // Use the output_audio.* channel exclusively to avoid double-sending
-      if (msg.type === "response.output_audio.delta" && msg.audio) {
-        try {
-          twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.audio } }));
-        } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
-        return;
+    // ---- Forward assistant audio to Twilio (μ-law base64) ----
+    // Dedupe identical chunks if both channels happen to fire.
+    function sendAudio(b64) {
+      if (!b64 || !streamSid) return;
+      if (b64 === lastAudioHash) return;
+      lastAudioHash = b64;
+      try {
+        twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: b64 } }));
+      } catch (e) {
+        console.error("❌ send audio to Twilio failed:", e?.message || e);
       }
-      if (msg.type === "response.output_audio.done") {
-        try { twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
-        return;
-      }
+    }
+
+    if (msg.type === "response.output_audio.delta" && msg.audio) {
+      sendAudio(msg.audio);
+      return;
+    }
+    if (msg.type === "response.audio.delta" && msg.delta) {
+      // Some sessions/models emit this legacy channel
+      sendAudio(msg.delta);
+      return;
+    }
+    if (msg.type === "response.output_audio.done" || msg.type === "response.audio.done") {
+      try { if (streamSid) twilioWS.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "tts-done" } })); } catch {}
+      return;
     }
   });
 
@@ -319,13 +331,11 @@ ${PROJECT_BRIEF}`
     const longSilence = t - lastSpeechAt >= SILENCE_MS;
     const hitMax = t - turnStartedAt >= MAX_TURN_MS;
 
-    // (A) Short pause or max-turn → real turn commit (ask to respond if free)
     if ((longSilence || hitMax) && bytesBuffered >= MIN_COMMIT_BYTES) {
       doCommit({ respond: !activeResponse, cause: hitMax ? "max" : "silence" });
       return;
     }
 
-    // (B) While caller is talking → periodic ASR-only trickles so you see 👂 deltas
     if (bytesBuffered >= MIN_COMMIT_BYTES) {
       commitTrickle();
     }
@@ -342,8 +352,9 @@ ${PROJECT_BRIEF}`
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
-        resetBuffer();
-        resetSinceCommit();
+        mulawChunks = [];
+        bytesBuffered = 0;
+        bytesSinceLastCommit = 0;
         mediaPackets = 0;
         lastSpeechAt = nowMs();
         turnStartedAt = nowMs();
@@ -351,6 +362,7 @@ ${PROJECT_BRIEF}`
         lastTrickleAt = 0;
         callerText = "";
         assistantText = "";
+        lastAudioHash = "";
         break;
 
       case "media": {
@@ -371,7 +383,6 @@ ${PROJECT_BRIEF}`
 
       case "stop":
         console.log("🛑 Twilio STOP event");
-        // Final ASR-only commit to flush any tail audio, but only if there is enough *new* audio
         if (bytesSinceLastCommit >= MIN_COMMIT_BYTES) {
           doCommit({ respond: false, cause: "stop" });
         }
