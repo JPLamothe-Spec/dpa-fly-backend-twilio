@@ -1,5 +1,6 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law)
 // Incremental: ASR trickle (always on), faster pause commits, commit cooldown, full transcripts.
+// + Private live transcription via SSE at /live and a minimal viewer at /transcript (token + dev-mode gated)
 
 const express = require("express");
 const http = require("http");
@@ -25,13 +26,13 @@ const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 
 // ---- VAD knobs (tunable via env)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise a touch to ignore room noise
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 450);     // ↓ from 500 → 450 for slightly quicker pause detection
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
 
-// ---- ASR “trickle” (always on) to surface 👂 YOU SAID continuously (no model reply)
-const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600); // cadence for ASR-only commits
-const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300); // debounce duplicate commits
+// ---- ASR “trickle” (always on)
+const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600);
+const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
 - Goal: natural, low-latency phone assistant for JP.
@@ -41,7 +42,7 @@ const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (
 // quick μ-law energy proxy
 function ulawEnergy(buf){ let s=0; for (let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
 
-// TwiML generator (keeps your prior shape)
+// TwiML generator
 function twiml(wsUrl) {
   return `
 <Response>
@@ -55,6 +56,120 @@ function twiml(wsUrl) {
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
+
+// ------------------------ PRIVATE TRANSCRIPT GATE -------------------------
+const TRANSCRIPT_TOKEN = (process.env.TRANSCRIPT_TOKEN || "").trim();
+
+/** Require dev-mode + token; returns true if allowed, else sends 401/403 and returns false */
+function requireDevAuth(req, res) {
+  // Require dev mode
+  if (!DEV_MODE) {
+    res.status(403).send("Transcripts disabled: ANNA_DEV_MODE is not true.");
+    return false;
+  }
+  // Require token configured
+  if (!TRANSCRIPT_TOKEN) {
+    res.status(403).send("Transcripts disabled: missing TRANSCRIPT_TOKEN on server.");
+    return false;
+  }
+  // Accept token via query (?token=), Authorization: Bearer <token>, or X-Dev-Token
+  const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+  const token = req.query.token || req.get("x-dev-token") || bearer || "";
+  if (token !== TRANSCRIPT_TOKEN) {
+    res.status(401).send("Unauthorized");
+    return false;
+  }
+  return true;
+}
+// -------------------------------------------------------------------------
+
+/* -------------------------- SSE broadcaster (private) -------------------- */
+const sseClients = new Set();
+/** Send an event to all connected /live listeners */
+function sseBroadcast(event, payload) {
+  const line = `event: ${event}\ndata: ${JSON.stringify({ ts: Date.now(), ...payload })}\n\n`;
+  for (const res of sseClients) {
+    try { res.write(line); } catch {}
+  }
+}
+/** Minimal SSE endpoint: /live (token-dev gated) */
+app.get("/live", (req, res) => {
+  if (!requireDevAuth(req, res)) return;
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Pragma": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.setHeader("Surrogate-Control", "no-store");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.flushHeaders?.();
+  res.write(": connected\n\n"); // comment/ping
+  sseClients.add(res);
+  req.on("close", () => { sseClients.delete(res); try { res.end(); } catch {} });
+});
+/** Simple viewer: /transcript (token-dev gated) */
+app.get("/transcript", (req, res) => {
+  if (!requireDevAuth(req, res)) return;
+  const token = (req.query.token || "").toString();
+  const html = `
+<!doctype html>
+<meta charset="utf-8">
+<title>DPA Live Transcript (Private)</title>
+<meta name="robots" content="noindex,nofollow">
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:0;background:#0b0c10;color:#e6edf3}
+  header{position:sticky;top:0;background:#11131a;padding:12px 16px;border-bottom:1px solid #1f232b}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
+  .col{background:#11131a;border:1px solid #1f232b;border-radius:12px;padding:12px;min-height:50vh}
+  .col h2{margin:0 0 8px 0;font-size:14px;color:#9fb1c5;letter-spacing:.03em;text-transform:uppercase}
+  .line{padding:6px 8px;border-bottom:1px dashed #232734;white-space:pre-wrap;word-wrap:break-word}
+  .you .line{color:#d9f99d}
+  .anna .line{color:#93c5fd}
+  .meta{font-size:12px;color:#9fb1c5;margin-left:6px}
+</style>
+<header>
+  <strong>DPA Live Transcript</strong>
+  <span class="meta">private /live (token & dev-mode)</span>
+</header>
+<main>
+  <section class="col you"><h2>👂 You Said</h2><div id="you"></div></section>
+  <section class="col anna"><h2>🗣️ Anna Said</h2><div id="anna"></div></section>
+</main>
+<script>
+  const you = document.getElementById('you');
+  const anna = document.getElementById('anna');
+  const token = ${JSON.stringify(token)};
+  if(!token){ document.body.innerHTML = '<p style="padding:16px">Missing ?token= in URL.</p>'; }
+  function add(el, text) {
+    const div = document.createElement('div');
+    div.className = 'line';
+    div.textContent = text;
+    el.prepend(div);
+  }
+  // Pass token through query string (EventSource cannot set headers)
+  const es = token ? new EventSource('/live?token=' + encodeURIComponent(token)) : null;
+  if (es) {
+    es.addEventListener('you_delta', (e)=> {
+      try{ const {text} = JSON.parse(e.data); if(text) add(you, text); }catch{}
+    });
+    es.addEventListener('you_turn', (e)=> {
+      try{ const {text} = JSON.parse(e.data); if(text) add(you, '— ' + text); }catch{}
+    });
+    es.addEventListener('anna_delta', (e)=> {
+      try{ const {text} = JSON.parse(e.data); if(text) add(anna, text); }catch{}
+    });
+    es.addEventListener('anna_turn', (e)=> {
+      try{ const {text} = JSON.parse(e.data); if(text) add(anna, '— ' + text); }catch{}
+    });
+    es.onerror = () => console.warn('SSE connection error');
+  }
+</script>`;
+  res.status(200).type("html").send(html);
+});
+/* ------------------------ END PRIVATE TRANSCRIPT ------------------------- */
 
 // --- Twilio webhook ---
 app.post("/twilio/voice", (req, res) => {
@@ -170,6 +285,7 @@ wss.on("connection", async (twilioWS, req) => {
       // On a turn commit, flush caller turn summary line
       if (respond && callerText.trim()) {
         console.log("👂 YOU (turn):", callerText.trim());
+        sseBroadcast("you_turn", { text: callerText.trim() });
         callerText = "";
       }
     } catch (e) {
@@ -259,47 +375,51 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Response lifecycle (prevents duplicate response.create)
+    // Response lifecycle
     if (msg.type === "response.created") { activeResponse = true; return; }
     if (msg.type === "response.completed" || msg.type === "response.output_audio.done" || msg.type === "response.refusal.delta") {
       activeResponse = false;
-      // Flush assistant turn summary line
-      if (assistantText.trim()) console.log("🗣️ ANNA (turn):", assistantText.trim());
+      if (assistantText.trim()) {
+        console.log("🗣️ ANNA (turn):", assistantText.trim());
+        sseBroadcast("anna_turn", { text: assistantText.trim() });
+      }
       assistantText = "";
       return;
     }
 
     // Assistant transcript (delta/streaming)
     if (msg.type === "response.audio_transcript.delta" && msg.delta) {
-      assistantText += String(msg.delta);
-      console.log("🗣️ ANNA SAID:", String(msg.delta));
+      const d = String(msg.delta);
+      assistantText += d;
+      console.log("🗣️ ANNA SAID:", d);
+      sseBroadcast("anna_delta", { text: d });
       return;
     }
 
     // Caller transcripts (arrive after each commit)
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
-      callerText += String(msg.delta);
-      console.log("👂 YOU SAID:", String(msg.delta));
+      const d = String(msg.delta);
+      callerText += d;
+      console.log("👂 YOU SAID:", d);
+      sseBroadcast("you_delta", { text: d });
       return;
     }
     if (msg.type === "response.input_text.delta" && msg.delta) {
-      callerText += String(msg.delta);
-      console.log("👂 YOU SAID (text):", String(msg.delta));
+      const d = String(msg.delta);
+      callerText += d;
+      console.log("👂 YOU SAID (text):", d);
+      sseBroadcast("you_delta", { text: d });
       return;
     }
 
-    // Forward assistant audio to Twilio (μ-law already, thanks to output_audio_format)
+    // Forward assistant audio to Twilio
     if (streamSid) {
       if (msg.type === "response.audio.delta" && msg.delta) {
-        try {
-          twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } }));
-        } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
+        try { twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.delta } })); } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
         return;
       }
       if (msg.type === "response.output_audio.delta" && msg.audio) {
-        try {
-          twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.audio } }));
-        } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
+        try { twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: msg.audio } })); } catch (e) { console.error("❌ send audio to Twilio failed:", e?.message || e); }
         return;
       }
       if (msg.type === "response.audio.done" || msg.type === "response.output_audio.done") {
@@ -313,17 +433,14 @@ ${PROJECT_BRIEF}`
   const vadPoll = setInterval(() => {
     if (!socketOpen || !sessionHealthy || sessionError) return;
 
-    const t = nowMs();
+    const t = Date.now();
     const longSilence = t - lastSpeechAt >= SILENCE_MS;
     const hitMax = t - turnStartedAt >= MAX_TURN_MS;
 
-    // (A) Short pause or max-turn → real turn commit (ask to respond if free)
     if ((longSilence || hitMax) && bytesBuffered >= MIN_COMMIT_BYTES) {
       doCommit({ respond: !activeResponse, cause: hitMax ? "max" : "silence" });
       return;
     }
-
-    // (B) While caller is talking → periodic ASR-only trickles so you see 👂 deltas
     if (bytesBuffered >= MIN_COMMIT_BYTES) {
       commitTrickle();
     }
@@ -342,8 +459,8 @@ ${PROJECT_BRIEF}`
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
         resetBuffer();
         mediaPackets = 0;
-        lastSpeechAt = nowMs();
-        turnStartedAt = nowMs();
+        lastSpeechAt = Date.now();
+        turnStartedAt = Date.now();
         lastCommitAt = 0;
         lastTrickleAt = 0;
         callerText = "";
@@ -356,7 +473,7 @@ ${PROJECT_BRIEF}`
         mediaPackets += 1;
         if (mediaPackets <= 5 || mediaPackets % 50 === 0) console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
         const e = ulawEnergy(mulaw);
-        if (e > SPEECH_THRESH) lastSpeechAt = nowMs();
+        if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
         mulawChunks.push(mulaw);
         bytesBuffered += mulaw.length;
         break;
@@ -367,8 +484,7 @@ ${PROJECT_BRIEF}`
 
       case "stop":
         console.log("🛑 Twilio STOP event");
-        // Final ASR-only commit to flush any tail audio, but don't request reply
-        doCommit({ respond: false, cause: "stop" });
+        doCommit({ respond: false, cause: "stop" }); // flush tail, no reply
         cleanup();
         break;
 
