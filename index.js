@@ -26,7 +26,7 @@ const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 
 // ---- VAD knobs (tunable via env)
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise a touch to ignore room noise
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);     // quicker pause detection
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // ↓ from 550 → 500 for slightly quicker pause detection
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
 
 // ---- ASR “trickle” (always on) to surface 👂 YOU SAID continuously (no model reply)
