@@ -1,6 +1,6 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law, 8kHz)
-// QoS pass: tiny 20ms pacing buffer (smoother TTS) + optional VAD noise-floor autocal.
-// Still includes: ASR trickle, faster pause commits, commit cooldown, full transcripts.
+// Stability pass: safer commit protocol (no empty commits), trickle OFF by default,
+// playback pacer kept for smoother TTS.
 
 const express = require("express");
 const http = require("http");
@@ -22,31 +22,31 @@ const TRANSCRIBE_MODEL = ALLOWED_ASR.has(TRANSCRIBE_MODEL_RAW) ? TRANSCRIBE_MODE
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
+// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 1200); // 150ms minimum per commit
 
 // ---- VAD knobs (tunable via env)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // base speech energy threshold
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);     // pause detection
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // max caller turn before commit
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 550);
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);
 
-// Optional: noise-floor autocal (set VAD_AUTOCAL_MS>0 to enable)
-const AUTOCAL_MS    = Number(process.env.VAD_AUTOCAL_MS || 0);       // e.g. 400 to autocal for first 0.4s
-const NOISE_OFFSET  = Number(process.env.VAD_NOISE_OFFSET || 6);     // added to baseline to form threshold
+// Optional: noise-floor autocal (disabled by default)
+const AUTOCAL_MS    = Number(process.env.VAD_AUTOCAL_MS || 0);
+const NOISE_OFFSET  = Number(process.env.VAD_NOISE_OFFSET || 6);
 
-// ---- ASR “trickle” (always on)
-const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600); // cadence for ASR-only commits
-const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300); // debounce duplicate commits
+// ---- ASR trickle — OFF by default (set >0 to enable)
+const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 0);   // e.g. 600 to enable trickle
+const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 250);
+
+// ---- Outbound pacing (audio to Twilio @ 20ms frames)
+const PACE_MS = Number(process.env.TTS_PACE_MS || 20);
+const PREBUFFER_FRAMES = Number(process.env.TTS_PREBUFFER_FRAMES || 2);
+const MAX_BUFFER_FRAMES = Number(process.env.TTS_MAX_BUFFER_FRAMES || 10);
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
 - Goal: natural, low-latency phone assistant for JP.
 - Priorities: realtime voice, AU/UK female voice, no unsolicited number capture, low latency, smooth barge-in.
 - Dev mode: treat caller as JP (teammate). Be concise, flag latency/transcription issues, suggest next tests.`;
-
-// ---- Outbound pacing (audio to Twilio @ 20ms frames)
-const PACE_MS = Number(process.env.TTS_PACE_MS || 20);                 // 20ms per μ-law frame
-const PREBUFFER_FRAMES = Number(process.env.TTS_PREBUFFER_FRAMES || 2); // 2*20=40ms prebuffer
-const MAX_BUFFER_FRAMES = Number(process.env.TTS_MAX_BUFFER_FRAMES || 10); // ~200ms before gentle catch-up
 
 // quick μ-law energy proxy
 function ulawEnergy(buf){ let s=0; for (let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
@@ -70,16 +70,12 @@ app.use(bodyParser.json());
 app.post("/twilio/voice", (req, res) => {
   const streamUrl = (process.env.PUBLIC_WS_URL || "").trim() || `wss://${req.headers.host}/call`;
   console.log("➡️ /twilio/voice hit (POST)");
-  const xml = twiml(streamUrl);
-  console.log("🧾 TwiML returned:", xml);
-  res.type("text/xml").send(xml);
+  res.type("text/xml").send(twiml(streamUrl));
 });
 app.get("/twilio/voice", (req, res) => {
   const streamUrl = (process.env.PUBLIC_WS_URL || "").trim() || `wss://${req.headers.host}/call`;
   console.log("➡️ /twilio/voice hit (GET)");
-  const xml = twiml(streamUrl);
-  console.log("🧾 TwiML returned:", xml);
-  res.type("text/xml").send(xml);
+  res.type("text/xml").send(twiml(streamUrl));
 });
 
 app.get("/", (_req, res) => res.status(200).send("Realtime DPA backend is live"));
@@ -129,18 +125,19 @@ wss.on("connection", async (twilioWS, req) => {
   let turnStartedAt = Date.now();
   let mediaPackets = 0;
 
-  // Session health & response gating
   let socketOpen = false;
   let sessionHealthy = false;
   let sessionError = false;
   let activeResponse = false;
 
-  // Commit guards
+  // commit coordination
   let lastCommitAt = 0;
   let commitInflight = false;
   let lastTrickleAt = 0;
+  let lastAppendMs = 0;         // ms appended in the *most recent* append preceding a commit
+  let commitEmptyBackoffUntil = 0;
 
-  // Transcript accumulators
+  // transcripts
   let callerText = "";
   let assistantText = "";
 
@@ -152,26 +149,20 @@ wss.on("connection", async (twilioWS, req) => {
   const nowMs = () => Date.now();
   const bufferedMs = (bytes) => Math.round((bytes / 800) * 100); // μ-law @8k
 
-  // ---- Outbound pacing: μ-law frames → steady 20ms to Twilio
+  // ---- Outbound pacing
   function makePacer() {
-    let frames = [];    // queue of 160-byte buffers (20ms at 8k μ-law)
+    let frames = [];
     let ticking = null;
     let started = false;
-
     function startTick() {
       if (ticking || !twilioWS || twilioWS.readyState !== WebSocket.OPEN) return;
       ticking = setInterval(() => {
         if (!streamSid || !frames.length) return;
-        // If backed up, send 2 frames this tick to catch up gently
         const burst = frames.length > MAX_BUFFER_FRAMES ? 2 : 1;
         for (let i = 0; i < burst; i++) {
           const f = frames.shift(); if (!f) break;
           try {
-            twilioWS.send(JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: f.toString("base64") }
-            }));
+            twilioWS.send(JSON.stringify({ event: "media", streamSid, media: { payload: f.toString("base64") } }));
           } catch {}
         }
       }, PACE_MS);
@@ -182,12 +173,11 @@ wss.on("connection", async (twilioWS, req) => {
       const buf = Buffer.from(b64, "base64");
       for (let i = 0; i + 160 <= buf.length; i += 160) frames.push(buf.subarray(i, i + 160));
       if (!started && frames.length >= PREBUFFER_FRAMES) { started = true; startTick(); } else { startTick(); }
-      if (frames.length > MAX_BUFFER_FRAMES * 2) frames = frames.slice(-MAX_BUFFER_FRAMES * 2); // hard cap
+      if (frames.length > MAX_BUFFER_FRAMES * 2) frames = frames.slice(-MAX_BUFFER_FRAMES * 2);
     }
-    function markUtteranceDone(){ started = false; } // allow drain
-    function cancelAndDrain(){ frames = []; started = false; }
+    function markUtteranceDone(){ started = false; }
     function destroy(){ stopTick(); frames = []; }
-    return { enqueueBase64, markUtteranceDone, cancelAndDrain, destroy };
+    return { enqueueBase64, markUtteranceDone, destroy };
   }
   const pacer = makePacer();
 
@@ -195,19 +185,21 @@ wss.on("connection", async (twilioWS, req) => {
     if (!socketOpen || !sessionHealthy || sessionError) return false;
     if (commitInflight) return false;
     if (nowMs() - lastCommitAt < COMMIT_COOLDOWN_MS) return false;
+    if (nowMs() < commitEmptyBackoffUntil) return false; // backoff after empty error
     return bytesBuffered >= MIN_COMMIT_BYTES && mulawChunks.length > 0;
   }
 
-  function doCommit({ respond, cause }) {
-    if (!canCommit()) return;
-
+  function doAppendAndCommit({ respond, cause }) {
+    // Snapshot current buffer
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 100) return; // API minimum to avoid commit_empty
-
+    if (ms < 150) return false; // stricter guard
     const b64 = payloadBuf.toString("base64");
+
+    // Mark inflight before sending to avoid re-entrancy
     commitInflight = true;
     lastCommitAt = nowMs();
+    lastAppendMs = ms;
 
     try {
       oai.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
@@ -215,30 +207,35 @@ wss.on("connection", async (twilioWS, req) => {
 
       if (respond && !activeResponse) {
         oai.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio","text"] } }));
-        activeResponse = true; // optimistic until response.created
+        activeResponse = true;
         console.log(`🔊 committed ~${ms}ms cause=${cause} (→ respond)`);
       } else {
         console.log(`🔊 committed ~${ms}ms cause=${cause} (no respond)`);
       }
-
-      if (respond && callerText.trim()) {
-        console.log("👂 YOU (turn):", callerText.trim());
-        callerText = "";
-      }
-    } catch (e) {
-      console.error("❌ send to Realtime failed:", e?.message || e);
-    } finally {
-      commitInflight = false;
+      // Clear local buffer only after we've sent both frames
       resetBuffer();
       turnStartedAt = nowMs();
+      return true;
+    } catch (e) {
+      console.error("❌ send to Realtime failed:", e?.message || e);
+      return false;
+    } finally {
+      commitInflight = false;
     }
   }
 
+  function commitIfReady({ respond, cause }) {
+    if (!canCommit()) return;
+    // Only allow a commit if we will append >=150ms right now.
+    doAppendAndCommit({ respond, cause });
+  }
+
   function commitTrickle() {
+    if (TRICKLE_MS <= 0) return; // disabled by default
     if (!canCommit()) return;
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
     lastTrickleAt = nowMs();
-    doCommit({ respond: false, cause: "trickle" });
+    doAppendAndCommit({ respond: false, cause: "trickle" });
   }
 
   // ---- OpenAI socket
@@ -282,7 +279,10 @@ ${PROJECT_BRIEF}`
     }, 120);
   });
 
-  oai.on("error", (e) => console.error("🔻 OAI socket error:", e?.message || e));
+  oai.on("error", (e) => {
+    const msg = e?.message || e;
+    console.error("🔻 OAI socket error:", msg);
+  });
   oai.on("close", (c, r) => console.log("🔚 OAI socket closed", c, r?.toString?.() || ""));
 
   // ---- OpenAI -> Twilio + Logs ----
@@ -297,6 +297,11 @@ ${PROJECT_BRIEF}`
 
     if (msg.type === "error") {
       console.error("🔻 OAI error:", msg);
+      if (msg?.error?.code === "input_audio_buffer_commit_empty") {
+        // brief backoff to avoid cascades; also clear local buffer
+        commitEmptyBackoffUntil = nowMs() + 250;
+        resetBuffer();
+      }
       const p = msg?.error?.param || "";
       if (String(p).startsWith("session.") || ["invalid_value","missing_required_parameter"].includes(msg?.error?.code)) {
         sessionError = true;
@@ -350,24 +355,22 @@ ${PROJECT_BRIEF}`
     }
   });
 
-  // ---- VAD/turn-taking + ASR trickle ----
-  const vadPoll = setInterval(() => {
+  // ---- VAD/turn-taking + optional trickle ----
+  const tick = setInterval(() => {
     if (!socketOpen || !sessionHealthy || sessionError) return;
 
     const t = nowMs();
     const longSilence = t - lastSpeechAt >= SILENCE_MS;
     const hitMax = t - turnStartedAt >= MAX_TURN_MS;
 
-    // (A) Short pause or max-turn → real turn commit (ask to respond if free)
-    if ((longSilence || hitMax) && bytesBuffered >= MIN_COMMIT_BYTES) {
-      doCommit({ respond: !activeResponse, cause: hitMax ? "max" : "silence" });
+    // (A) Real turn commit (respond if assistant is idle)
+    if ((longSilence || hitMax)) {
+      commitIfReady({ respond: !activeResponse, cause: hitMax ? "max" : "silence" });
       return;
     }
 
-    // (B) While caller is talking → periodic ASR-only trickles so you see 👂 deltas
-    if (bytesBuffered >= MIN_COMMIT_BYTES) {
-      commitTrickle();
-    }
+    // (B) Optional periodic ASR-only trickles
+    commitTrickle();
   }, 50);
 
   // Twilio inbound media
@@ -381,12 +384,15 @@ ${PROJECT_BRIEF}`
       case "start":
         streamSid = data.start?.streamSid || null;
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
-        resetBuffer();
+        mulawChunks = [];
+        bytesBuffered = 0;
         mediaPackets = 0;
         lastSpeechAt = nowMs();
         turnStartedAt = nowMs();
         lastCommitAt = 0;
         lastTrickleAt = 0;
+        lastAppendMs = 0;
+        commitEmptyBackoffUntil = 0;
         callerText = "";
         assistantText = "";
         break;
@@ -400,7 +406,6 @@ ${PROJECT_BRIEF}`
 
         // Optional: autocalibrate noise floor during first AUTOCAL_MS
         if (AUTOCAL_MS > 0 && nowMs() - callStartAt < AUTOCAL_MS) {
-          // crude running max-ish: bias toward higher ambient
           speechThresh = Math.max(speechThresh, Math.round(e + NOISE_OFFSET));
         }
 
@@ -415,8 +420,12 @@ ${PROJECT_BRIEF}`
 
       case "stop":
         console.log("🛑 Twilio STOP event");
-        // Final ASR-only commit to flush any tail audio, but don't request reply
-        doCommit({ respond: false, cause: "stop" });
+        // Final ASR-only commit only if we actually have ≥150ms staged
+        if (bytesBuffered >= 1200 && mulawChunks.length > 0) {
+          doAppendAndCommit({ respond: false, cause: "stop" });
+        } else {
+          resetBuffer();
+        }
         cleanup();
         break;
 
@@ -429,7 +438,7 @@ ${PROJECT_BRIEF}`
   twilioWS.on("error", (err) => { console.error("⚠️ Twilio WS error:", err?.message || err); cleanup(); });
 
   function cleanup(){
-    try { clearInterval(vadPoll); } catch {}
+    try { clearInterval(tick); } catch {}
     try { pacer.destroy(); } catch {}
     try { if (oai.readyState === WebSocket.OPEN) oai.close(); } catch {}
     try { if (twilioWS.readyState === WebSocket.OPEN) twilioWS.close(); } catch {}
