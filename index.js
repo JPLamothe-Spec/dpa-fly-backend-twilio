@@ -1,6 +1,9 @@
 // index.js — Twilio PSTN ↔ OpenAI Realtime (μ-law)
-// Incremental: ASR trickle (always on), faster pause commits, commit cooldown, full transcripts.
-// + Private live transcription via SSE at /live and a minimal viewer at /transcript (token + dev-mode gated)
+// Features:
+// • Env-driven persona (name/role/tone/style/greeting)
+// • Private live transcription via SSE at /live and viewer at /transcript (token + dev-mode)
+// • ASR trickle, VAD-based turn-taking, low-latency tweaks
+// • Caller transcript fix for non-prefixed event
 
 const express = require("express");
 const http = require("http");
@@ -22,22 +25,29 @@ const TRANSCRIBE_MODEL = ALLOWED_ASR.has(TRANSCRIBE_MODEL_RAW) ? TRANSCRIBE_MODE
 const DEV_MODE = String(process.env.ANNA_DEV_MODE || "true").toLowerCase() === "true";
 const DEV_CALLER_NAME = process.env.DEV_CALLER_NAME || "JP";
 
-// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
-
-// ---- VAD knobs (tunable via env)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
-
-// ---- ASR “trickle” (always on)
-const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600);
-const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
+// Persona from env
+const DPA_NAME = process.env.DPA_NAME || "Anna";
+const DPA_ROLE = process.env.DPA_ROLE || "your assistant";
+const DPA_TONE = process.env.DPA_TONE || "friendly and helpful";
+const DPA_STYLE = process.env.DPA_STYLE || "keeps responses short and clear";
+const DPA_GREETING = process.env.DPA_GREETING || "Hi—how can I help?";
 
 const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (DPA)
 - Goal: natural, low-latency phone assistant for JP.
 - Priorities: realtime voice, AU/UK female voice, no unsolicited number capture, low latency, smooth barge-in.
 - Dev mode: treat caller as JP (teammate). Be concise, flag latency/transcription issues, suggest next tests.`;
+
+// μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
+
+// ---- VAD knobs (tunable via env)
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise to ignore room noise
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection (550→500)
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
+
+// ---- ASR “trickle” (always on) so 👂 YOU SAID appears during speech
+const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600);
+const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
 
 // quick μ-law energy proxy
 function ulawEnergy(buf){ let s=0; for (let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
@@ -62,17 +72,14 @@ const TRANSCRIPT_TOKEN = (process.env.TRANSCRIPT_TOKEN || "").trim();
 
 /** Require dev-mode + token; returns true if allowed, else sends 401/403 and returns false */
 function requireDevAuth(req, res) {
-  // Require dev mode
   if (!DEV_MODE) {
     res.status(403).send("Transcripts disabled: ANNA_DEV_MODE is not true.");
     return false;
   }
-  // Require token configured
   if (!TRANSCRIPT_TOKEN) {
     res.status(403).send("Transcripts disabled: missing TRANSCRIPT_TOKEN on server.");
     return false;
   }
-  // Accept token via query (?token=), Authorization: Bearer <token>, or X-Dev-Token
   const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
   const token = req.query.token || req.get("x-dev-token") || bearer || "";
   if (token !== TRANSCRIPT_TOKEN) {
@@ -85,14 +92,12 @@ function requireDevAuth(req, res) {
 
 /* -------------------------- SSE broadcaster (private) -------------------- */
 const sseClients = new Set();
-/** Send an event to all connected /live listeners */
 function sseBroadcast(event, payload) {
   const line = `event: ${event}\ndata: ${JSON.stringify({ ts: Date.now(), ...payload })}\n\n`;
   for (const res of sseClients) {
     try { res.write(line); } catch {}
   }
 }
-/** Minimal SSE endpoint: /live (token-dev gated) */
 app.get("/live", (req, res) => {
   if (!requireDevAuth(req, res)) return;
   res.set({
@@ -106,11 +111,10 @@ app.get("/live", (req, res) => {
   res.setHeader("Surrogate-Control", "no-store");
   res.setHeader("X-Robots-Tag", "noindex, nofollow");
   res.flushHeaders?.();
-  res.write(": connected\n\n"); // comment/ping
+  res.write(": connected\n\n");
   sseClients.add(res);
   req.on("close", () => { sseClients.delete(res); try { res.end(); } catch {} });
 });
-/** Simple viewer: /transcript (token-dev gated) */
 app.get("/transcript", (req, res) => {
   if (!requireDevAuth(req, res)) return;
   const token = (req.query.token || "").toString();
@@ -136,7 +140,7 @@ app.get("/transcript", (req, res) => {
 </header>
 <main>
   <section class="col you"><h2>👂 You Said</h2><div id="you"></div></section>
-  <section class="col anna"><h2>🗣️ Anna Said</h2><div id="anna"></div></section>
+  <section class="col anna"><h2>🗣️ ${DPA_NAME} Said</h2><div id="anna"></div></section>
 </main>
 <script>
   const you = document.getElementById('you');
@@ -149,21 +153,12 @@ app.get("/transcript", (req, res) => {
     div.textContent = text;
     el.prepend(div);
   }
-  // Pass token through query string (EventSource cannot set headers)
   const es = token ? new EventSource('/live?token=' + encodeURIComponent(token)) : null;
   if (es) {
-    es.addEventListener('you_delta', (e)=> {
-      try{ const {text} = JSON.parse(e.data); if(text) add(you, text); }catch{}
-    });
-    es.addEventListener('you_turn', (e)=> {
-      try{ const {text} = JSON.parse(e.data); if(text) add(you, '— ' + text); }catch{}
-    });
-    es.addEventListener('anna_delta', (e)=> {
-      try{ const {text} = JSON.parse(e.data); if(text) add(anna, text); }catch{}
-    });
-    es.addEventListener('anna_turn', (e)=> {
-      try{ const {text} = JSON.parse(e.data); if(text) add(anna, '— ' + text); }catch{}
-    });
+    es.addEventListener('you_delta', (e)=> { try{ const {text}=JSON.parse(e.data); if(text) add(you, text);}catch{} });
+    es.addEventListener('you_turn', (e)=> { try{ const {text}=JSON.parse(e.data); if(text) add(you, '— ' + text);}catch{} });
+    es.addEventListener('anna_delta', (e)=> { try{ const {text}=JSON.parse(e.data); if(text) add(anna, text);}catch{} });
+    es.addEventListener('anna_turn', (e)=> { try{ const {text}=JSON.parse(e.data); if(text) add(anna, '— ' + text);}catch{} });
     es.onerror = () => console.warn('SSE connection error');
   }
 </script>`;
@@ -264,8 +259,7 @@ wss.on("connection", async (twilioWS, req) => {
 
     const payloadBuf = Buffer.concat(mulawChunks);
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 100) return; // hard stop: API minimum to avoid commit_empty
-
+    if (ms < 100) return; // API minimum
     const b64 = payloadBuf.toString("base64");
     commitInflight = true;
     lastCommitAt = nowMs();
@@ -282,7 +276,6 @@ wss.on("connection", async (twilioWS, req) => {
         console.log(`🔊 committed ~${ms}ms cause=${cause} (no respond)`);
       }
 
-      // On a turn commit, flush caller turn summary line
       if (respond && callerText.trim()) {
         console.log("👂 YOU (turn):", callerText.trim());
         sseBroadcast("you_turn", { text: callerText.trim() });
@@ -298,26 +291,25 @@ wss.on("connection", async (twilioWS, req) => {
   }
 
   function commitTrickle() {
-    // ASR-only trickle so we always get 👂 YOU SAID deltas, even while Anna is speaking
     if (!canCommit()) return;
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
     lastTrickleAt = nowMs();
-    doCommit({ respond: false, cause: "trickle" });
+    doCommit({ respond: false, cause: "trickle" }); // ASR-only
   }
 
   oai.on("open", () => {
     socketOpen = true;
     console.log("🔗 OpenAI Realtime connected");
 
+    const persona = `${DPA_NAME}, ${DPA_ROLE}. Speak in a ${DPA_TONE} tone and ${DPA_STYLE}.`;
     const instructions = DEV_MODE
-      ? `You are Anna, JP’s English-accented digital personal assistant AND a core member of the DPA build team.
+      ? `You are ${persona}
 Caller is ${DEV_CALLER_NAME}. Be concise. Avoid asking for phone numbers unless requested.
 
 PROJECT BRIEF:
 ${PROJECT_BRIEF}`
-      : `You are Anna, JP’s assistant on a live phone call. Be concise and helpful.`;
+      : `You are ${persona}`;
 
-    // Configure session: μ-law in/out + ASR model
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -330,24 +322,18 @@ ${PROJECT_BRIEF}`
       }
     };
 
-    try {
-      oai.send(JSON.stringify(sessionUpdate));
-    } catch (e) {
-      console.error("❌ session.update send failed:", e?.message || e);
-    }
+    try { oai.send(JSON.stringify(sessionUpdate)); }
+    catch (e) { console.error("❌ session.update send failed:", e?.message || e); }
 
-    // Single greeting once session is valid
     setTimeout(() => {
       if (!sessionError) {
         try {
           oai.send(JSON.stringify({
             type: "response.create",
-            response: { modalities: ["audio","text"], instructions: "Hi—how can I help?" }
+            response: { modalities: ["audio","text"], instructions: DPA_GREETING }
           }));
-          activeResponse = true; // optimistic until response.created arrives
-        } catch (e) {
-          console.error("❌ greeting send failed:", e?.message || e);
-        }
+          activeResponse = true;
+        } catch (e) { console.error("❌ greeting send failed:", e?.message || e); }
       }
     }, 120);
   });
@@ -359,7 +345,11 @@ ${PROJECT_BRIEF}`
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // Session health
+    // Debug peek for transcription-ish events
+    if (msg?.type && (msg.type.includes("transcript") || msg.type.includes("input_audio") || msg.type.includes("input_text"))) {
+      console.log("🔎 OAI event:", msg.type);
+    }
+
     if (msg.type === "session.updated") {
       sessionHealthy = true;
       console.log(`✅ session.updated (ASR=${TRANSCRIBE_MODEL})`);
@@ -375,12 +365,11 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Response lifecycle
     if (msg.type === "response.created") { activeResponse = true; return; }
     if (msg.type === "response.completed" || msg.type === "response.output_audio.done" || msg.type === "response.refusal.delta") {
       activeResponse = false;
       if (assistantText.trim()) {
-        console.log("🗣️ ANNA (turn):", assistantText.trim());
+        console.log(`🗣️ ${DPA_NAME.toUpperCase()} (turn):`, assistantText.trim());
         sseBroadcast("anna_turn", { text: assistantText.trim() });
       }
       assistantText = "";
@@ -391,12 +380,12 @@ ${PROJECT_BRIEF}`
     if (msg.type === "response.audio_transcript.delta" && msg.delta) {
       const d = String(msg.delta);
       assistantText += d;
-      console.log("🗣️ ANNA SAID:", d);
+      console.log(`🗣️ ${DPA_NAME.toUpperCase()} SAID:`, d);
       sseBroadcast("anna_delta", { text: d });
       return;
     }
 
-    // Caller transcripts (arrive after each commit)
+    // Caller transcripts (after each commit)
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
       const d = String(msg.delta);
       callerText += d;
@@ -408,6 +397,14 @@ ${PROJECT_BRIEF}`
       const d = String(msg.delta);
       callerText += d;
       console.log("👂 YOU SAID (text):", d);
+      sseBroadcast("you_delta", { text: d });
+      return;
+    }
+    // Non-prefixed caller delta (some runtimes)
+    if (msg.type === "input_audio_transcription.delta" && msg.delta) {
+      const d = String(msg.delta);
+      callerText += d;
+      console.log("👂 YOU SAID (np):", d);
       sseBroadcast("you_delta", { text: d });
       return;
     }
