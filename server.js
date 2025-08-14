@@ -1,20 +1,24 @@
-// index.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
+/// server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
 // Production-safe: debounced input commits, live dev transcripts, persona entirely from env.
 
-require("dotenv").config();
+if (process.env.NODE_ENV !== 'production') {
+  try { require('dotenv').config(); } catch {}
+}
 
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const bodyParser = require("body-parser");
+const { personaFromEnv } = require("./persona");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 
-const { personaFromEnv } = require("./persona");
+// ---- Healthcheck for Fly ----
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 // ---- Config ----
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Twilio sends 20 ms G.711 µ-law frames at 8 kHz
@@ -70,7 +74,6 @@ function makeAudioBuffer() {
     hasMin() {
       return this.ms >= MIN_COMMIT_MS;
     },
-    // Concatenate base64 frames into one base64 string
     takeAllAsBase64() {
       const out = this.chunks.join("");
       this.clear();
@@ -90,7 +93,6 @@ wss.on("connection", (twilioWS, req) => {
     return;
   }
 
-  // Load persona + models from env
   const persona = personaFromEnv();
   console.log("🧠 Persona loaded:", {
     voice: persona.voice,
@@ -109,7 +111,6 @@ wss.on("connection", (twilioWS, req) => {
     }
   );
 
-  // Buffer for input audio we’ll commit to OAI
   const inBuf = makeAudioBuffer();
   let trickleTimer = null;
   let streamSid = null;
@@ -119,8 +120,8 @@ wss.on("connection", (twilioWS, req) => {
     trickleTimer = setInterval(() => {
       if (!oaiWS || oaiWS.readyState !== WebSocket.OPEN) return;
       if (!inBuf.hasMin()) return;
+      // Append buffered frames once, then commit
       const b64 = inBuf.takeAllAsBase64();
-      // Append + commit
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       console.log("🔊 committed ~%dms cause=trickle (no respond)", MIN_COMMIT_MS);
@@ -134,17 +135,12 @@ wss.on("connection", (twilioWS, req) => {
 
   // Forward OpenAI audio back to Twilio
   function sendAudioToTwilio(base64Mulaw) {
-    // Twilio bidirectional media expects "media" events back
     if (twilioWS.readyState === WebSocket.OPEN) {
-      const msg = {
-        event: "media",
-        media: { payload: base64Mulaw }
-      };
-      twilioWS.send(JSON.stringify(msg));
+      twilioWS.send(JSON.stringify({ event: "media", media: { payload: base64Mulaw } }));
     }
   }
 
-  // ---- Twilio events → buffer audio & control commits ----
+  // ---- Twilio events → buffer audio (NO per-frame append to OpenAI) ----
   twilioWS.on("message", (msg) => {
     let data;
     try { data = JSON.parse(msg.toString()); } catch { return; }
@@ -158,26 +154,21 @@ wss.on("connection", (twilioWS, req) => {
       case "media": {
         const payload = data.media?.payload;
         if (!payload) return;
-        // 20 ms G.711 µ-law base64 frame from Twilio
+        // Buffer only; we will append+commit in controlled chunks
         inBuf.push(payload);
-        // If OpenAI is ready and we’ve got at least one frame, append (no commit yet)
-        if (oaiWS.readyState === WebSocket.OPEN) {
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
-        }
         break;
       }
 
       case "mark":
       case "stop":
         console.log("🧵 Twilio event:", data.event);
-        // Flush what we have if it meets minimum
         if (oaiWS.readyState === WebSocket.OPEN && inBuf.hasMin()) {
           const b64 = inBuf.takeAllAsBase64();
           oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
           oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
           console.log("🔊 committed (stop/mark) ≥%dms", MIN_COMMIT_MS);
         } else {
-          inBuf.clear(); // drop partials to avoid empty-commit errors
+          inBuf.clear();
         }
         break;
 
@@ -197,28 +188,20 @@ wss.on("connection", (twilioWS, req) => {
   // ---- OpenAI Realtime handlers ----
   oaiWS.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
-
-    // Configure session: env persona + codecs to match Twilio
     const sessionUpdate = {
       type: "session.update",
       session: {
         instructions: persona.instructions,
         voice: persona.voice,
-        // Input is G.711 µ-law @ 8 kHz from Twilio
         input_audio_format: { type: "g711_ulaw", sample_rate_hz: TWILIO_SAMPLE_RATE },
-        // Output same so we can pass straight back to Twilio
         output_audio_format: { type: "g711_ulaw", sample_rate_hz: TWILIO_SAMPLE_RATE },
-        // Keep ASR/latency sensible
         turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 100, silence_duration_ms: 200 },
         modalities: ["audio", "text"],
         input_audio_transcription: { model: persona.asrModel }
       }
     };
-
     oaiWS.send(JSON.stringify(sessionUpdate));
     console.log("✅ session.updated (ASR=%s)", persona.asrModel);
-
-    // Start trickle commit timer
     startTrickle();
   });
 
@@ -226,7 +209,6 @@ wss.on("connection", (twilioWS, req) => {
     let evt;
     try { evt = JSON.parse(msg.toString()); } catch { return; }
 
-    // Debug/dev logs similar to what you’ve been using
     switch (evt.type) {
       case "response.audio_transcript.delta":
         if (evt.delta?.length) console.log("🗣️ ANNA SAID:", evt.delta);
@@ -242,38 +224,29 @@ wss.on("connection", (twilioWS, req) => {
 
       case "input_audio_buffer.speech_stopped":
         console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
-        // Try to flush if we have enough buffered
         if (inBuf.hasMin()) {
           const b64 = inBuf.takeAllAsBase64();
           oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
           oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
           console.log("🔊 committed (speech_stopped) ≥%dms", MIN_COMMIT_MS);
         } else {
-          inBuf.clear();
-          // No commit — prevents "buffer too small" errors
           console.log("⚠️ skipped commit (only %dms buffered)", inBuf.ms);
+          inBuf.clear();
         }
         break;
 
+      // Caller transcript (if model emits it)
       case "conversation.item.input_audio_transcription.delta":
         if (evt.delta?.transcript) console.log("👂 YOU SAID (conv.delta):", evt.delta.transcript);
-        else console.log("🔎 conv.delta arrived but no transcript field found");
         break;
 
       case "conversation.item.input_audio_transcription.completed":
         if (evt.transcript) console.log("👂 YOU SAID (conv.completed):", evt.transcript);
-        else console.log("🔎 conv.completed arrived but no transcript field found");
         break;
 
-      // Audio from OpenAI to play to caller
+      // Audio from OpenAI back to caller
       case "response.audio.delta":
         if (evt.delta) sendAudioToTwilio(evt.delta);
-        break;
-
-      case "response.completed":
-      case "response.created":
-      case "response.output_text.delta":
-        // optional: add any extra logs you like
         break;
 
       case "error":
@@ -281,7 +254,6 @@ wss.on("connection", (twilioWS, req) => {
         break;
 
       default:
-        // Uncomment to see everything:
         // console.log("OAI evt:", evt.type);
         break;
     }
