@@ -3,7 +3,8 @@
 // • Env-driven persona (name/role/tone/style/greeting)
 // • Private live transcription via SSE at /live and viewer at /transcript (token + dev-mode)
 // • ASR trickle, VAD-based turn-taking, low-latency tweaks
-// • Robust caller transcript handling (response.*, input_*.*, and conversation.item.*)
+// • Robust caller transcript handling (response.*, input_*.*, conversation.item.*)
+// • Final-only caller transcript mode to avoid duplication
 
 const express = require("express");
 const http = require("http");
@@ -38,16 +39,19 @@ const PROJECT_BRIEF = process.env.PROJECT_BRIEF || `Digital Personal Assistant (
 - Dev mode: treat caller as JP (teammate). Be concise, flag latency/transcription issues, suggest next tests.`;
 
 // μ-law @8k: 160B ≈ 20ms, 800B ≈ 100ms (API minimum)
-const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
+const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 1200); // safer default ≈150ms
 
 // ---- VAD knobs (tunable via env)
-const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise to ignore room noise
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection
-const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
+const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);
+const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);
 
 // ---- ASR “trickle” (always on) so 👂 YOU SAID appears during speech
 const TRICKLE_MS         = Number(process.env.VAD_TRICKLE_MS || 600);
 const COMMIT_COOLDOWN_MS = Number(process.env.COMMIT_COOLDOWN_MS || 300);
+
+// Caller transcript display: "final" (default) or "live"
+const CALLER_TRANSCRIPT_MODE = (process.env.CALLER_TRANSCRIPT_MODE || "final").toLowerCase();
 
 // quick μ-law energy proxy
 function ulawEnergy(buf){ let s=0; for (let i=0;i<buf.length;i++) s+=Math.abs(buf[i]-0x7f); return s/buf.length; }
@@ -152,6 +156,7 @@ app.get("/transcript", (req, res) => {
     div.className = 'line';
     div.textContent = text;
     el.prepend(div);
+    return div;
   }
   const es = token ? new EventSource('/live?token=' + encodeURIComponent(token)) : null;
   if (es) {
@@ -276,9 +281,9 @@ wss.on("connection", async (twilioWS, req) => {
     if (!canCommit()) return;
 
     const payloadBuf = Buffer.concat(mulawChunks);
-    if (!payloadBuf.length) return; // NEW: avoid empty commit race
+    if (!payloadBuf.length) return;              // guard: avoid empty commits
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 100) return; // API minimum to avoid commit_empty
+    if (ms < 100) return;                        // API minimum to avoid commit_empty
 
     const b64 = payloadBuf.toString("base64");
     commitInflight = true;
@@ -312,11 +317,10 @@ wss.on("connection", async (twilioWS, req) => {
   }
 
   function commitTrickle() {
-    // ASR-only trickle so we always get 👂 YOU SAID deltas, even while DPA is speaking
     if (!canCommit()) return;
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
     lastTrickleAt = nowMs();
-    doCommit({ respond: false, cause: "trickle" });
+    doCommit({ respond: false, cause: "trickle" }); // ASR-only
   }
 
   oai.on("open", () => {
@@ -332,7 +336,6 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are ${persona}`;
 
-    // Configure session: μ-law in/out + ASR model
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -345,13 +348,9 @@ ${PROJECT_BRIEF}`
       }
     };
 
-    try {
-      oai.send(JSON.stringify(sessionUpdate));
-    } catch (e) {
-      console.error("❌ session.update send failed:", e?.message || e);
-    }
+    try { oai.send(JSON.stringify(sessionUpdate)); }
+    catch (e) { console.error("❌ session.update send failed:", e?.message || e); }
 
-    // Single greeting once session is valid
     setTimeout(() => {
       if (!sessionError) {
         try {
@@ -359,10 +358,8 @@ ${PROJECT_BRIEF}`
             type: "response.create",
             response: { modalities: ["audio","text"], instructions: DPA_GREETING }
           }));
-          activeResponse = true; // optimistic until response.created arrives
-        } catch (e) {
-          console.error("❌ greeting send failed:", e?.message || e);
-        }
+          activeResponse = true;
+        } catch (e) { console.error("❌ greeting send failed:", e?.message || e); }
       }
     }, 120);
   });
@@ -421,14 +418,14 @@ ${PROJECT_BRIEF}`
       const d = String(msg.delta);
       callerText += d;
       console.log("👂 YOU SAID:", d);
-      sseBroadcast("you_delta", { text: d });
+      if (CALLER_TRANSCRIPT_MODE === "live") sseBroadcast("you_delta", { text: d });
       return;
     }
     if (msg.type === "response.input_text.delta" && msg.delta) {
       const d = String(msg.delta);
       callerText += d;
       console.log("👂 YOU SAID (text):", d);
-      sseBroadcast("you_delta", { text: d });
+      if (CALLER_TRANSCRIPT_MODE === "live") sseBroadcast("you_delta", { text: d });
       return;
     }
 
@@ -438,7 +435,7 @@ ${PROJECT_BRIEF}`
       if (t) {
         callerText += t;
         console.log("👂 YOU SAID (np.delta):", t);
-        sseBroadcast("you_delta", { text: t });
+        if (CALLER_TRANSCRIPT_MODE === "live") sseBroadcast("you_delta", { text: t });
       }
       return;
     }
@@ -447,19 +444,18 @@ ${PROJECT_BRIEF}`
       if (t) {
         callerText += t;
         console.log("👂 YOU SAID (np.completed):", t);
-        sseBroadcast("you_delta", { text: t });
         sseBroadcast("you_turn", { text: t });
       }
       return;
     }
 
-    // NEW: conversation.item.* caller transcripts (from your logs)
+    // conversation.item.* caller transcripts (seen in your logs)
     if (msg.type === "conversation.item.input_audio_transcription.delta") {
       const t = extractTranscript(msg) || extractTranscript({ delta: msg.delta, item: msg.item });
       if (t) {
         callerText += t;
         console.log("👂 YOU SAID (conv.delta):", t);
-        sseBroadcast("you_delta", { text: t });
+        if (CALLER_TRANSCRIPT_MODE === "live") sseBroadcast("you_delta", { text: t });
       } else {
         console.log("🔎 conv.delta arrived but no transcript field found");
       }
@@ -470,7 +466,6 @@ ${PROJECT_BRIEF}`
       if (t) {
         callerText += t;
         console.log("👂 YOU SAID (conv.completed):", t);
-        sseBroadcast("you_delta", { text: t });
         sseBroadcast("you_turn", { text: t });
       } else {
         console.log("🔎 conv.completed arrived but no transcript field found");
