@@ -3,7 +3,7 @@
 // • Env-driven persona (name/role/tone/style/greeting)
 // • Private live transcription via SSE at /live and viewer at /transcript (token + dev-mode)
 // • ASR trickle, VAD-based turn-taking, low-latency tweaks
-// • Caller transcript fixes for non-prefixed and completed events
+// • Robust caller transcript handling (response.*, input_*.*, and conversation.item.*)
 
 const express = require("express");
 const http = require("http");
@@ -42,7 +42,7 @@ const MIN_COMMIT_BYTES = Number(process.env.MIN_COMMIT_BYTES || 800);
 
 // ---- VAD knobs (tunable via env)
 const SPEECH_THRESH = Number(process.env.VAD_SPEECH_THRESH || 18);   // raise to ignore room noise
-const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection (550→500)
+const SILENCE_MS    = Number(process.env.VAD_SILENCE_MS || 500);     // quicker pause detection
 const MAX_TURN_MS   = Number(process.env.VAD_MAX_TURN_MS || 3200);   // slightly snappier max turn
 
 // ---- ASR “trickle” (always on) so 👂 YOU SAID appears during speech
@@ -199,6 +199,24 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
+// Helper: extract transcript text from a variety of payload shapes
+function extractTranscript(m) {
+  if (!m || typeof m !== "object") return "";
+  if (m.transcript) return String(m.transcript);
+  if (m.text) return String(m.text);
+  if (typeof m.delta === "string") return m.delta;
+  if (m.delta && m.delta.text) return String(m.delta.text);
+  if (m.delta && m.delta.transcript) return String(m.delta.transcript);
+  if (m.item?.formatted?.transcript) return String(m.item.formatted.transcript);
+  const c = m.item?.content || m.delta?.content;
+  if (Array.isArray(c) && c.length) {
+    const first = c[0];
+    if (first?.transcript) return String(first.transcript);
+    if (first?.text) return String(first.text);
+  }
+  return "";
+}
+
 // --- Bridge Twilio <-> OpenAI Realtime ---
 wss.on("connection", async (twilioWS, req) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress;
@@ -258,8 +276,10 @@ wss.on("connection", async (twilioWS, req) => {
     if (!canCommit()) return;
 
     const payloadBuf = Buffer.concat(mulawChunks);
+    if (!payloadBuf.length) return; // NEW: avoid empty commit race
     const ms = bufferedMs(payloadBuf.length);
-    if (ms < 100) return; // API minimum
+    if (ms < 100) return; // API minimum to avoid commit_empty
+
     const b64 = payloadBuf.toString("base64");
     commitInflight = true;
     lastCommitAt = nowMs();
@@ -276,6 +296,7 @@ wss.on("connection", async (twilioWS, req) => {
         console.log(`🔊 committed ~${ms}ms cause=${cause} (no respond)`);
       }
 
+      // On a turn commit, flush caller turn summary line
       if (respond && callerText.trim()) {
         console.log("👂 YOU (turn):", callerText.trim());
         sseBroadcast("you_turn", { text: callerText.trim() });
@@ -291,10 +312,11 @@ wss.on("connection", async (twilioWS, req) => {
   }
 
   function commitTrickle() {
+    // ASR-only trickle so we always get 👂 YOU SAID deltas, even while DPA is speaking
     if (!canCommit()) return;
     if (nowMs() - lastTrickleAt < TRICKLE_MS) return;
     lastTrickleAt = nowMs();
-    doCommit({ respond: false, cause: "trickle" }); // ASR-only
+    doCommit({ respond: false, cause: "trickle" });
   }
 
   oai.on("open", () => {
@@ -310,6 +332,7 @@ PROJECT BRIEF:
 ${PROJECT_BRIEF}`
       : `You are ${persona}`;
 
+    // Configure session: μ-law in/out + ASR model
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -322,9 +345,13 @@ ${PROJECT_BRIEF}`
       }
     };
 
-    try { oai.send(JSON.stringify(sessionUpdate)); }
-    catch (e) { console.error("❌ session.update send failed:", e?.message || e); }
+    try {
+      oai.send(JSON.stringify(sessionUpdate));
+    } catch (e) {
+      console.error("❌ session.update send failed:", e?.message || e);
+    }
 
+    // Single greeting once session is valid
     setTimeout(() => {
       if (!sessionError) {
         try {
@@ -332,8 +359,10 @@ ${PROJECT_BRIEF}`
             type: "response.create",
             response: { modalities: ["audio","text"], instructions: DPA_GREETING }
           }));
-          activeResponse = true;
-        } catch (e) { console.error("❌ greeting send failed:", e?.message || e); }
+          activeResponse = true; // optimistic until response.created arrives
+        } catch (e) {
+          console.error("❌ greeting send failed:", e?.message || e);
+        }
       }
     }, 120);
   });
@@ -345,11 +374,12 @@ ${PROJECT_BRIEF}`
   oai.on("message", (buf) => {
     let msg; try { msg = JSON.parse(buf.toString()); } catch { return; }
 
-    // Debug peek for transcription-ish events (helps surface new shapes)
+    // Debug peek for transcription-ish events
     if (msg?.type && (msg.type.includes("transcript") || msg.type.includes("input_audio") || msg.type.includes("input_text"))) {
       console.log("🔎 OAI event:", msg.type);
     }
 
+    // Session health
     if (msg.type === "session.updated") {
       sessionHealthy = true;
       console.log(`✅ session.updated (ASR=${TRANSCRIBE_MODEL})`);
@@ -365,6 +395,7 @@ ${PROJECT_BRIEF}`
       return;
     }
 
+    // Response lifecycle
     if (msg.type === "response.created") { activeResponse = true; return; }
     if (msg.type === "response.completed" || msg.type === "response.output_audio.done" || msg.type === "response.refusal.delta") {
       activeResponse = false;
@@ -385,7 +416,7 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // Caller transcripts (common)
+    // Caller transcripts — common prefixed events
     if (msg.type === "response.input_audio_transcription.delta" && msg.delta) {
       const d = String(msg.delta);
       callerText += d;
@@ -401,32 +432,49 @@ ${PROJECT_BRIEF}`
       return;
     }
 
-    // --- EXTRA HANDLERS: alternate shapes seen in some runtimes ---
-
-    // Non-prefixed delta
-    if (msg.type === "input_audio_transcription.delta" && msg.delta) {
-      const d = String(msg.delta);
-      callerText += d;
-      console.log("👂 YOU SAID (np.delta):", d);
-      sseBroadcast("you_delta", { text: d });
+    // Non-prefixed caller deltas/completed (some runtimes)
+    if (msg.type === "input_audio_transcription.delta" && (msg.delta || msg.text)) {
+      const t = extractTranscript(msg);
+      if (t) {
+        callerText += t;
+        console.log("👂 YOU SAID (np.delta):", t);
+        sseBroadcast("you_delta", { text: t });
+      }
+      return;
+    }
+    if (msg.type === "input_audio_transcription.completed" && (msg.transcript || msg.text)) {
+      const t = extractTranscript(msg);
+      if (t) {
+        callerText += t;
+        console.log("👂 YOU SAID (np.completed):", t);
+        sseBroadcast("you_delta", { text: t });
+        sseBroadcast("you_turn", { text: t });
+      }
       return;
     }
 
-    // Completed events with full transcript
-    if (msg.type === "response.input_audio_transcription.completed" && msg.transcript) {
-      const t = String(msg.transcript);
-      callerText += t;
-      console.log("👂 YOU SAID (completed):", t);
-      sseBroadcast("you_delta", { text: t });
-      sseBroadcast("you_turn", { text: t });
+    // NEW: conversation.item.* caller transcripts (from your logs)
+    if (msg.type === "conversation.item.input_audio_transcription.delta") {
+      const t = extractTranscript(msg) || extractTranscript({ delta: msg.delta, item: msg.item });
+      if (t) {
+        callerText += t;
+        console.log("👂 YOU SAID (conv.delta):", t);
+        sseBroadcast("you_delta", { text: t });
+      } else {
+        console.log("🔎 conv.delta arrived but no transcript field found");
+      }
       return;
     }
-    if (msg.type === "input_audio_transcription.completed" && msg.transcript) {
-      const t = String(msg.transcript);
-      callerText += t;
-      console.log("👂 YOU SAID (np.completed):", t);
-      sseBroadcast("you_delta", { text: t });
-      sseBroadcast("you_turn", { text: t });
+    if (msg.type === "conversation.item.input_audio_transcription.completed") {
+      const t = extractTranscript(msg) || extractTranscript({ transcript: msg.transcript, item: msg.item });
+      if (t) {
+        callerText += t;
+        console.log("👂 YOU SAID (conv.completed):", t);
+        sseBroadcast("you_delta", { text: t });
+        sseBroadcast("you_turn", { text: t });
+      } else {
+        console.log("🔎 conv.completed arrived but no transcript field found");
+      }
       return;
     }
 
@@ -451,7 +499,7 @@ ${PROJECT_BRIEF}`
   const vadPoll = setInterval(() => {
     if (!socketOpen || !sessionHealthy || sessionError) return;
 
-    const t = Date.now();
+    const t = nowMs();
     const longSilence = t - lastSpeechAt >= SILENCE_MS;
     const hitMax = t - turnStartedAt >= MAX_TURN_MS;
 
@@ -477,8 +525,8 @@ ${PROJECT_BRIEF}`
         console.log(`🎬 Twilio stream START: streamSid=${streamSid}, voice=${VOICE}, model=${REALTIME_MODEL}, dev=${DEV_MODE}`);
         resetBuffer();
         mediaPackets = 0;
-        lastSpeechAt = Date.now();
-        turnStartedAt = Date.now();
+        lastSpeechAt = nowMs();
+        turnStartedAt = nowMs();
         lastCommitAt = 0;
         lastTrickleAt = 0;
         callerText = "";
@@ -491,7 +539,7 @@ ${PROJECT_BRIEF}`
         mediaPackets += 1;
         if (mediaPackets <= 5 || mediaPackets % 50 === 0) console.log(`🟢 media pkt #${mediaPackets} (+${mulaw.length} bytes)`);
         const e = ulawEnergy(mulaw);
-        if (e > SPEECH_THRESH) lastSpeechAt = Date.now();
+        if (e > SPEECH_THRESH) lastSpeechAt = nowMs();
         mulawChunks.push(mulaw);
         bytesBuffered += mulaw.length;
         break;
