@@ -5,7 +5,7 @@ import http from "http";
 import { WebSocketServer } from "ws";
 import WebSocket from "ws";
 
-const PORT = Number(process.env.PORT) || 8080; // Fly expects 8080
+const PORT = Number(process.env.PORT) || 3000; // Fly expects 8080
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OAI_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
