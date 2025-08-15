@@ -1,59 +1,59 @@
 // src/utils/realtime.js
-// Helpers for Realtime URL, append frames, and a Twilio 100ms commit coalescer.
+// Helpers for OpenAI Realtime URL building, audio frame encoding, and Twilio frame coalescing.
 
 export function createRealtimeUrl({ model, voice, dev }) {
-  const base = process.env.OPENAI_REALTIME_URL || 'wss://api.openai.com/v1/realtime';
+  const base = (process.env.OPENAI_REALTIME_URL || 'wss://api.openai.com/v1/realtime').replace(/\/+$/, '');
   const params = new URLSearchParams({
-    model: model || 'gpt-4o-realtime-preview-2024-12-17',
-    voice: voice || 'shimmer',
+    model: model || process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17',
+    voice: voice || process.env.OPENAI_REALTIME_VOICE || 'shimmer',
     ...(dev ? { dev: 'true' } : {})
   });
   return `${base}?${params.toString()}`;
 }
 
 /**
- * Realtime expects `input_audio_buffer.append` frames either as JSON with `audio` field
- * (base64) or as binary frames with a frame header. JSON is simplest here.
+ * Encodes a μ-law@8k audio frame for Realtime API JSON append.
+ * The API will decode based on `input_audio_format` from session.update.
  */
 export function encodeAppendFrame(base64Mulaw) {
   return JSON.stringify({
     type: 'input_audio_buffer.append',
-    audio: base64Mulaw,
-    // Since we set input_audio_format to g711_ulaw in session.update,
-    // the server will decode correctly from μ-law 8k.
+    audio: base64Mulaw
   });
 }
 
 /**
- * Coalesces Twilio's 20ms frames until we have >= minCommitMs,
- * then invokes onCommit with a single base64 string.
+ * Groups Twilio 20ms μ-law frames into larger commits (minCommitMs),
+ * reducing request overhead to the Realtime API.
  */
 export class TwilioCoalescer {
-  constructor({ minCommitMs = 120, onCommit }) {
-    this.minCommitMs = minCommitMs;
+  constructor({ minCommitMs = process.env.COMMIT_MIN_MS || 120, frameMs = 20, onCommit }) {
+    this.minCommitMs = Number(minCommitMs);
+    this.frameMs = Number(frameMs);
     this.onCommit = onCommit;
     this.frames = [];
     this.ms = 0;
   }
-  push(base64MulawFrame, frameMs = 20) {
-    this.frames.push(base64MulawFrame);
-    this.ms += frameMs;
+
+  push(base64Frame) {
+    this.frames.push(base64Frame);
+    this.ms += this.frameMs;
+
     if (this.ms >= this.minCommitMs) {
-      const packed = this.frames.join(''); // base64-safe concat (same alphabet)
-      const approxMs = this.ms;
-      this.frames = [];
-      this.ms = 0;
-      this.onCommit?.({ data: packed, approxMs });
-      // onCommit expects raw base64 string:
-      this.onCommit?.(Object.assign(packed, { approxMs })); // convenience for old callers
+      this.commit();
     }
   }
-  flush() {
+
+  commit() {
     if (!this.frames.length) return;
     const packed = this.frames.join('');
     const approxMs = this.ms;
     this.frames = [];
     this.ms = 0;
-    this.onCommit?.(Object.assign(packed, { approxMs }));
+    this.onCommit?.({ audio: packed, approxMs });
+  }
+
+  flush() {
+    this.commit();
   }
 }
