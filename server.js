@@ -1,5 +1,8 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
-// Production-safe: debounced input commits, persona from env, Twilio μ-law end-to-end.
+// Debounced input commits, Twilio μ-law end-to-end. Updated to:
+// 1) Use string audio format fields (g711_ulaw) in session.update
+// 2) Remove unsupported session.input_audio_language
+// 3) Guard commits so we never commit an empty buffer
 
 if (process.env.NODE_ENV !== 'production') {
   try { require('dotenv').config(); } catch {}
@@ -78,6 +81,7 @@ function makeAudioBuffer() {
       return this.ms >= MIN_COMMIT_MS;
     },
     takeAllAsBase64() {
+      if (!this.chunks.length) return ""; // guard: nothing to send
       const out = this.chunks.join("");
       this.clear();
       return out;
@@ -118,15 +122,21 @@ wss.on("connection", (twilioWS, req) => {
   let trickleTimer = null;
   let streamSid = null;
 
+  function safeAppendAndCommit() {
+    if (!oaiWS || oaiWS.readyState !== WebSocket.OPEN) return;
+    if (!inBuf.hasMin()) return;
+    const b64 = inBuf.takeAllAsBase64();
+    if (!b64 || b64.length === 0) return; // guard: never commit empty
+    oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+    oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+    console.log("🔊 committed ≥%dms", MIN_COMMIT_MS);
+  }
+
   function startTrickle() {
     if (trickleTimer) return;
     trickleTimer = setInterval(() => {
-      if (!oaiWS || oaiWS.readyState !== WebSocket.OPEN) return;
-      if (!inBuf.hasMin()) return;
-      const b64 = inBuf.takeAllAsBase64();
-      oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      console.log("🔊 committed ~%dms cause=trickle (no respond)", MIN_COMMIT_MS);
+      // periodic flush during speech, but never empty
+      safeAppendAndCommit();
     }, TRICKLE_INTERVAL_MS);
   }
 
@@ -165,14 +175,7 @@ wss.on("connection", (twilioWS, req) => {
       case "mark":
       case "stop":
         console.log("🧵 Twilio event:", data.event);
-        if (oaiWS.readyState === WebSocket.OPEN && inBuf.hasMin()) {
-          const b64 = inBuf.takeAllAsBase64();
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          console.log("🔊 committed (stop/mark) ≥%dms", MIN_COMMIT_MS);
-        } else {
-          inBuf.clear();
-        }
+        safeAppendAndCommit();
         break;
 
       default:
@@ -198,9 +201,8 @@ wss.on("connection", (twilioWS, req) => {
       session: {
         instructions: persona.instructions,
         voice: persona.voice,
-        input_audio_format: "g711_ulaw",                  // Twilio μ-law
-        input_audio_language: persona.language || "en-AU",// optional but helpful
-        output_audio_format: "g711_ulaw",                 // to stream straight back to Twilio
+        input_audio_format: "g711_ulaw",   // Twilio μ-law input
+        output_audio_format: "g711_ulaw",  // μ-law back to Twilio
         modalities: ["audio", "text"],
         // Basic VAD settings to keep latency sensible
         turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 100, silence_duration_ms: 200 },
@@ -235,15 +237,7 @@ wss.on("connection", (twilioWS, req) => {
 
       case "input_audio_buffer.speech_stopped":
         console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
-        if (inBuf.hasMin()) {
-          const b64 = inBuf.takeAllAsBase64();
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-          console.log("🔊 committed (speech_stopped) ≥%dms", MIN_COMMIT_MS);
-        } else {
-          console.log("⚠️ skipped commit (only %dms buffered)", inBuf.ms);
-          inBuf.clear();
-        }
+        safeAppendAndCommit();
         break;
 
       // Caller transcript (if model emits)
