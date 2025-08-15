@@ -1,5 +1,5 @@
-/// server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
-// Production-safe: debounced input commits, live dev transcripts, persona entirely from env.
+// server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
+// Production-safe: debounced input commits, persona from env, Twilio μ-law end-to-end.
 
 if (process.env.NODE_ENV !== 'production') {
   try { require('dotenv').config(); } catch {}
@@ -25,24 +25,25 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TWILIO_SAMPLE_RATE = 8000;
 const TWILIO_FRAME_MS = 20;
 
-// Commit policy: avoid "buffer too small" errors
-const MIN_COMMIT_MS = 120;         // only commit if ≥ 120 ms buffered
-const TRICKLE_INTERVAL_MS = 600;   // periodic trickle if enough buffered
+// Commit policy
+const MIN_COMMIT_MS = 120;       // commit only if ≥120ms buffered
+const TRICKLE_INTERVAL_MS = 600; // periodic commit cadence while speech flows
 
-// ---- Twilio Voice Webhook ----
+// ---- Twilio Voice Webhook → returns TwiML with <Stream> ----
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
-  const wsUrl = `wss://${host}/call`;
+  const wsUrl = `wss://${host}${process.env.TWILIO_STREAM_PATH || "/call"}`;
 
-  const twiml = `
-    <Response>
-      <Connect>
-        <Stream url="${wsUrl}" track="inbound_track"/>
-      </Connect>
-      <Pause length="30"/>
-    </Response>
-  `.trim();
+  const twiml =
+    `<Response>` +
+      `<Connect>` +
+        `<Stream url="${wsUrl}" track="inbound_track"/>` +
+      `</Connect>` +
+      `<Pause length="${process.env.TWIML_PAUSE_LEN || "600"}"/>` +
+    `</Response>`;
 
+  console.log("➡️ /twilio/voice hit (POST)");
+  console.log("🧾 TwiML returned:\n" + twiml);
   res.type("text/xml").send(twiml);
 });
 
@@ -51,11 +52,13 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/call") {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-  } else {
+  const wanted = process.env.TWILIO_STREAM_PATH || "/call";
+  const path = new URL(req.url, `http://${req.headers.host}`).pathname;
+  if (path !== wanted) {
     socket.destroy();
+    return;
   }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
 // ---- Helpers for buffering/commits ----
@@ -120,7 +123,6 @@ wss.on("connection", (twilioWS, req) => {
     trickleTimer = setInterval(() => {
       if (!oaiWS || oaiWS.readyState !== WebSocket.OPEN) return;
       if (!inBuf.hasMin()) return;
-      // Append buffered frames once, then commit
       const b64 = inBuf.takeAllAsBase64();
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
@@ -148,14 +150,15 @@ wss.on("connection", (twilioWS, req) => {
     switch (data.event) {
       case "start":
         streamSid = data.start?.streamSid;
-        console.log("🎬 Twilio stream START:", { streamSid, voice: persona.voice, model: persona.ttsModel, dev: !!process.env.DEV_MODE });
+        console.log("🎬 Twilio stream START:", {
+          streamSid, voice: persona.voice, model: persona.ttsModel, dev: !!process.env.DEV_MODE
+        });
         break;
 
       case "media": {
         const payload = data.media?.payload;
         if (!payload) return;
-        // Buffer only; we will append+commit in controlled chunks
-        inBuf.push(payload);
+        inBuf.push(payload); // buffer 20ms μ-law frames
         break;
       }
 
@@ -188,20 +191,26 @@ wss.on("connection", (twilioWS, req) => {
   // ---- OpenAI Realtime handlers ----
   oaiWS.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
+
+    // IMPORTANT: input/output audio formats MUST be strings (not objects)
     const sessionUpdate = {
       type: "session.update",
       session: {
         instructions: persona.instructions,
         voice: persona.voice,
-        input_audio_format: { type: "g711_ulaw", sample_rate_hz: TWILIO_SAMPLE_RATE },
-        output_audio_format: { type: "g711_ulaw", sample_rate_hz: TWILIO_SAMPLE_RATE },
-        turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 100, silence_duration_ms: 200 },
+        input_audio_format: "g711_ulaw",                  // Twilio μ-law
+        input_audio_language: persona.language || "en-AU",// optional but helpful
+        output_audio_format: "g711_ulaw",                 // to stream straight back to Twilio
         modalities: ["audio", "text"],
+        // Basic VAD settings to keep latency sensible
+        turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 100, silence_duration_ms: 200 },
         input_audio_transcription: { model: persona.asrModel }
       }
     };
+
     oaiWS.send(JSON.stringify(sessionUpdate));
-    console.log("✅ session.updated (ASR=%s)", persona.asrModel);
+    console.log("✅ session.updated (ASR=%s, format=g711_ulaw)", persona.asrModel);
+
     startTrickle();
   });
 
@@ -210,6 +219,7 @@ wss.on("connection", (twilioWS, req) => {
     try { evt = JSON.parse(msg.toString()); } catch { return; }
 
     switch (evt.type) {
+      // (optional) assistant transcript
       case "response.audio_transcript.delta":
         if (evt.delta?.length) console.log("🗣️ ANNA SAID:", evt.delta);
         break;
@@ -218,6 +228,7 @@ wss.on("connection", (twilioWS, req) => {
         console.log("🔎 OAI event: response.audio_transcript.done");
         break;
 
+      // Speech segmentation hints
       case "input_audio_buffer.speech_started":
         console.log("🔎 OAI event: input_audio_buffer.speech_started");
         break;
@@ -235,7 +246,7 @@ wss.on("connection", (twilioWS, req) => {
         }
         break;
 
-      // Caller transcript (if model emits it)
+      // Caller transcript (if model emits)
       case "conversation.item.input_audio_transcription.delta":
         if (evt.delta?.transcript) console.log("👂 YOU SAID (conv.delta):", evt.delta.transcript);
         break;
