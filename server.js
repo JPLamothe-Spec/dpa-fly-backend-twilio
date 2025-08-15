@@ -27,11 +27,11 @@ const {
   OAI_MODEL = 'gpt-4o-realtime-preview-2024-12-17',
   OAI_VOICE = 'shimmer',
   ASR_MODEL = 'gpt-4o-mini-transcribe',
-  LANGUAGE = 'en-AU',
+  LANGUAGE = 'en-AU', // we normalize this below
   VAD_THRESHOLD = '0.55',
   VAD_PREFIX_MS = '120',
   VAD_SILENCE_MS = '220',
-  AUTO_RESPONSE = 'false', // set to "true" to nudge response.create after speech stop
+  AUTO_RESPONSE = 'false', // "true" to nudge response.create after speech stop
   PUBLIC_WS_URL,
   PORT: ENV_PORT
 } = process.env;
@@ -41,6 +41,14 @@ if (!OPENAI_API_KEY) {
   console.error('Missing OPENAI_API_KEY');
   process.exit(1);
 }
+
+/* Normalize ASR language: "en-AU" -> "en"; fallback "en" */
+function normalizeLang(code) {
+  if (!code) return 'en';
+  const two = String(code).toLowerCase().split(/[_-]/)[0];
+  return two || 'en';
+}
+const ASR_LANGUAGE = normalizeLang(LANGUAGE);
 
 /* ---------- App ---------- */
 const app = express();
@@ -84,6 +92,7 @@ wss.on('connection', async (twilioWS, req) => {
   let frames = [];
   let msBuffered = 0;
   let commitInFlight = false;
+  let sessionReady = false;
 
   function sendToTwilioMedia(b64) {
     if (twilioWS.readyState !== twilioWS.OPEN || !streamSid) return;
@@ -104,6 +113,7 @@ wss.on('connection', async (twilioWS, req) => {
 
   function commitIfReady(cause = 'chunk') {
     if (!oaiWS || oaiWS.readyState !== oaiWS.OPEN) return;
+    if (!sessionReady) return; // don't commit until session.update succeeded
     if (commitInFlight) return;
     if (frames.length === 0 || msBuffered < MIN_COMMIT_MS) return;
     try {
@@ -136,12 +146,12 @@ wss.on('connection', async (twilioWS, req) => {
   oaiWS.on('open', () => {
     console.log('🔗 OpenAI Realtime connected');
 
-    // Configure session. Important: audio formats are STRINGS (not objects).
+    // Configure session. IMPORTANT: audio formats are STRINGS (not objects).
     const sessionUpdate = {
       type: 'session.update',
       session: {
         voice: OAI_VOICE,
-        input_audio_transcription: { model: ASR_MODEL, language: LANGUAGE },
+        input_audio_transcription: { model: ASR_MODEL, language: ASR_LANGUAGE },
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         turn_detection: {
@@ -154,7 +164,7 @@ wss.on('connection', async (twilioWS, req) => {
       }
     };
     oaiWS.send(JSON.stringify(sessionUpdate));
-    console.log(`✅ session.updated (ASR=${ASR_MODEL}, format=g711_ulaw)`);
+    console.log(`➡️ session.update sent (ASR=${ASR_MODEL}, lang=${ASR_LANGUAGE}, format=g711_ulaw)`);
 
     // Keep Twilio stream alive with non-audio marks (safe)
     keepaliveTimer = setInterval(() => {
@@ -170,6 +180,12 @@ wss.on('connection', async (twilioWS, req) => {
     const msg = SAFE_JSON(data.toString());
     if (!msg) return;
 
+    if (msg.type === 'session.updated') {
+      sessionReady = true;
+      console.log('✅ session.updated ACK from OpenAI');
+      return;
+    }
+
     // Clear commit lock when server acknowledges
     if (msg.type === 'input_audio_buffer.committed' || msg.type === 'input_audio_buffer.cleared') {
       commitInFlight = false;
@@ -178,6 +194,8 @@ wss.on('connection', async (twilioWS, req) => {
 
     if (msg.type === 'error') {
       console.log('🔻 OAI error:', JSON.stringify(msg, null, 2));
+      // If session.update failed (e.g., invalid language), we won't be "ready"
+      // and appends/commits will be ignored. Keep lock open to allow retry.
       if (msg.error?.code === 'input_audio_buffer_commit_empty') {
         commitInFlight = false; // allow next attempt
       }
@@ -264,10 +282,13 @@ wss.on('connection', async (twilioWS, req) => {
       if (!payload) return;
 
       try {
-        oaiWS?.send(JSON.stringify({
-          type: 'input_audio_buffer.append',
-          audio: payload // base64 g711_ulaw, matches session.input_audio_format
-        }));
+        // Only append after session is confirmed ready to avoid wasting frames
+        if (sessionReady) {
+          oaiWS?.send(JSON.stringify({
+            type: 'input_audio_buffer.append',
+            audio: payload // base64 g711_ulaw, matches session.input_audio_format
+          }));
+        }
       } catch {}
 
       // Local buffering for commit policy (best effort)
@@ -316,9 +337,9 @@ server.listen(PORT, () => {
  * OAI_MODEL=gpt-4o-realtime-preview-2024-12-17
  * OAI_VOICE=shimmer
  * ASR_MODEL=gpt-4o-mini-transcribe
- * LANGUAGE=en-AU
+ * LANGUAGE=en-AU                  # we'll normalize this to 'en'
  * PUBLIC_WS_URL=wss://dpa-fly-backend-twilio.fly.dev/call
- * AUTO_RESPONSE=false   # set to "true" only if model stays silent after you speak
+ * AUTO_RESPONSE=false             # set to "true" only if model stays silent after you speak
  *
  * (Optionally tweak VAD:)
  * VAD_THRESHOLD=0.55
