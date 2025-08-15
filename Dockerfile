@@ -2,17 +2,22 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Install deps from lockfile for repeatable builds
-COPY package*.json ./
-RUN npm ci --omit=dev
+# Copy manifest + lockfile if present
+COPY package.json package-lock.json* ./
 
-# Copy source
+# Use lockfile when available; otherwise fall back safely
+RUN if [ -f package-lock.json ]; then \
+      npm ci --omit=dev; \
+    else \
+      npm install --omit=dev; \
+    fi
+
+# Copy the rest
 COPY . .
 
-# Env & port
 ENV NODE_ENV=production
 ENV PORT=3000
 EXPOSE 3000
 
-# Start the correct entry file
+# Ensure we start the right file
 CMD ["node", "server.js"]
