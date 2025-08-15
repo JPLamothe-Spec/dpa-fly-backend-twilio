@@ -1,8 +1,5 @@
 // server.js — Twilio <Stream> ↔ OpenAI Realtime bridge (persona from env)
-// Debounced input commits, Twilio μ-law end-to-end. Updated to:
-// 1) Use string audio format fields (g711_ulaw) in session.update
-// 2) Remove unsupported session.input_audio_language
-// 3) Guard commits so we never commit an empty buffer
+// Fix: batch audio correctly by concatenating BYTES (not base64 strings)
 
 if (process.env.NODE_ENV !== 'production') {
   try { require('dotenv').config(); } catch {}
@@ -25,7 +22,6 @@ const PORT = Number(process.env.PORT || 3000);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 // Twilio sends 20 ms G.711 µ-law frames at 8 kHz
-const TWILIO_SAMPLE_RATE = 8000;
 const TWILIO_FRAME_MS = 20;
 
 // Commit policy
@@ -65,26 +61,33 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // ---- Helpers for buffering/commits ----
+// IMPORTANT: store Buffers (decoded bytes), not base64 strings.
 function makeAudioBuffer() {
   return {
-    chunks: [],
+    chunks: /** @type {Buffer[]} */ ([]),
     ms: 0,
     push(base64Mulaw20ms) {
-      this.chunks.push(base64Mulaw20ms);
-      this.ms += TWILIO_FRAME_MS;
+      try {
+        const buf = Buffer.from(base64Mulaw20ms, "base64");
+        if (buf.length > 0) {
+          this.chunks.push(buf);
+          this.ms += TWILIO_FRAME_MS;
+        }
+      } catch {}
     },
     clear() {
       this.chunks = [];
       this.ms = 0;
     },
     hasMin() {
-      return this.ms >= MIN_COMMIT_MS;
+      return this.ms >= MIN_COMMIT_MS && this.chunks.length > 0;
     },
+    // Concatenate bytes, then return ONE base64 string
     takeAllAsBase64() {
-      if (!this.chunks.length) return ""; // guard: nothing to send
-      const out = this.chunks.join("");
+      if (!this.chunks.length) return "";
+      const outBuf = Buffer.concat(this.chunks);
       this.clear();
-      return out;
+      return outBuf.toString("base64");
     }
   };
 }
@@ -126,7 +129,7 @@ wss.on("connection", (twilioWS, req) => {
     if (!oaiWS || oaiWS.readyState !== WebSocket.OPEN) return;
     if (!inBuf.hasMin()) return;
     const b64 = inBuf.takeAllAsBase64();
-    if (!b64 || b64.length === 0) return; // guard: never commit empty
+    if (!b64) return; // never commit empty
     oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
     oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
     console.log("🔊 committed ≥%dms", MIN_COMMIT_MS);
@@ -134,10 +137,7 @@ wss.on("connection", (twilioWS, req) => {
 
   function startTrickle() {
     if (trickleTimer) return;
-    trickleTimer = setInterval(() => {
-      // periodic flush during speech, but never empty
-      safeAppendAndCommit();
-    }, TRICKLE_INTERVAL_MS);
+    trickleTimer = setInterval(safeAppendAndCommit, TRICKLE_INTERVAL_MS);
   }
 
   function stopTrickle() {
@@ -152,7 +152,7 @@ wss.on("connection", (twilioWS, req) => {
     }
   }
 
-  // ---- Twilio events → buffer audio (NO per-frame append to OpenAI) ----
+  // ---- Twilio events → buffer audio ----
   twilioWS.on("message", (msg) => {
     let data;
     try { data = JSON.parse(msg.toString()); } catch { return; }
@@ -168,7 +168,7 @@ wss.on("connection", (twilioWS, req) => {
       case "media": {
         const payload = data.media?.payload;
         if (!payload) return;
-        inBuf.push(payload); // buffer 20ms μ-law frames
+        inBuf.push(payload); // decode + buffer 20ms μ-law bytes
         break;
       }
 
@@ -195,7 +195,7 @@ wss.on("connection", (twilioWS, req) => {
   oaiWS.on("open", () => {
     console.log("🔗 OpenAI Realtime connected");
 
-    // IMPORTANT: input/output audio formats MUST be strings (not objects)
+    // Audio formats MUST be strings
     const sessionUpdate = {
       type: "session.update",
       session: {
@@ -204,7 +204,7 @@ wss.on("connection", (twilioWS, req) => {
         input_audio_format: "g711_ulaw",   // Twilio μ-law input
         output_audio_format: "g711_ulaw",  // μ-law back to Twilio
         modalities: ["audio", "text"],
-        // Basic VAD settings to keep latency sensible
+        // VAD settings to keep latency sensible
         turn_detection: { type: "server_vad", threshold: 0.5, prefix_padding_ms: 100, silence_duration_ms: 200 },
         input_audio_transcription: { model: persona.asrModel }
       }
@@ -221,7 +221,6 @@ wss.on("connection", (twilioWS, req) => {
     try { evt = JSON.parse(msg.toString()); } catch { return; }
 
     switch (evt.type) {
-      // (optional) assistant transcript
       case "response.audio_transcript.delta":
         if (evt.delta?.length) console.log("🗣️ ANNA SAID:", evt.delta);
         break;
@@ -230,7 +229,6 @@ wss.on("connection", (twilioWS, req) => {
         console.log("🔎 OAI event: response.audio_transcript.done");
         break;
 
-      // Speech segmentation hints
       case "input_audio_buffer.speech_started":
         console.log("🔎 OAI event: input_audio_buffer.speech_started");
         break;
@@ -240,7 +238,6 @@ wss.on("connection", (twilioWS, req) => {
         safeAppendAndCommit();
         break;
 
-      // Caller transcript (if model emits)
       case "conversation.item.input_audio_transcription.delta":
         if (evt.delta?.transcript) console.log("👂 YOU SAID (conv.delta):", evt.delta.transcript);
         break;
@@ -249,7 +246,6 @@ wss.on("connection", (twilioWS, req) => {
         if (evt.transcript) console.log("👂 YOU SAID (conv.completed):", evt.transcript);
         break;
 
-      // Audio from OpenAI back to caller
       case "response.audio.delta":
         if (evt.delta) sendAudioToTwilio(evt.delta);
         break;
