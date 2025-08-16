@@ -1,15 +1,15 @@
 /**
- * server.js — Twilio <-> OpenAI Realtime bridge with persona.js alignment
- * - Uses persona.js (CommonJS) as single source of truth
- * - Short greeting, no caller naming, JP noted as creator
- * - Full transcript logging (assistant + user)
- * - Keeps audio passthrough g711_ulaw and server VAD
+ * server.js — Twilio <-> OpenAI Realtime bridge (CommonJS)
+ * Fixes:
+ *  - Removed node-fetch (ESM import crash)
+ *  - Added GET / and /healthz for Fly smoke checks
+ *  - Full transcript logging (user + assistant)
+ *  - Persona alignment & “don’t call the caller Anna”
  */
 
 const express = require("express");
 const bodyParser = require("body-parser");
 const WebSocket = require("ws");
-const fetch = require("node-fetch");
 const path = require("path");
 const http = require("http");
 
@@ -18,7 +18,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_REALTIME_MODEL =
   process.env.OPENAI_REALTIME_MODEL || "gpt-4o-realtime-preview-2024-12-17";
 
-// ---- Load persona.js (CommonJS) ----
+// --- Load persona ---
 const persona = (() => {
   try {
     return require(path.resolve(__dirname, "persona.js"));
@@ -39,10 +39,18 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// --- Health endpoints for Fly smoke checks ---
+app.get("/", (_req, res) => {
+  res.status(200).send("OK");
+});
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ ok: true, model: OPENAI_REALTIME_MODEL, voice: persona.voice });
+});
+
 // --- TwiML: connect Twilio Media Stream to our WS endpoint ---
 app.post("/twilio/voice", (req, res) => {
   const host = req.headers["x-forwarded-host"] || req.headers.host;
-  const wsUrl = `wss://${host}/call`; // IMPORTANT: secure wss
+  const wsUrl = `wss://${host}/call`;
   console.log("➡️ /twilio/voice hit (POST)");
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -59,28 +67,27 @@ app.post("/twilio/voice", (req, res) => {
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/call" });
 
-// Utility: build strict system instructions aligned with persona
+// Helpers
 function buildSystemInstructions(p) {
   return [
     p.instructions?.trim() || "",
     `You are ${p.name}, also known as DPA.`,
-    `Mode: Test Mode unless caller explicitly requests a real task.`,
-    `Never address the caller by any name. Do not call the caller "Anna"; "Anna" is your own name.`,
+    `Default to Test Mode unless caller requests a real task.`,
+    `Never address the caller by any name. Do NOT call the caller "Anna" — that's your own name.`,
     `Speak only ${p.language || "en"}. Keep replies to one short sentence, then a concise follow-up question.`,
     `Stay on-topic for testing capability, quality, and response times.`,
     `If unclear, ask one brief, targeted question.`,
-    `JP is the creator of DPA. If you refer to JP, call them "JP".`,
+    `JP is the creator of DPA; refer to them as "JP".`,
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-// --- Bridge: Twilio WS <-> OpenAI Realtime WS ---
 wss.on("connection", async (twilioWS, req) => {
   const remoteAddr = req.socket.remoteAddress;
   console.log(`✅ Twilio WebSocket connected from ${remoteAddr}`);
 
-  // Create OpenAI Realtime WS
+  // Connect to OpenAI Realtime
   const oaiURL = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(
     OPENAI_REALTIME_MODEL
   )}`;
@@ -94,11 +101,10 @@ wss.on("connection", async (twilioWS, req) => {
 
   let oaiConnected = false;
 
-  // Buffers for transcript logging
+  // Transcript buffers
   let currentAssistantText = "";
   let currentUserText = "";
 
-  // Helper: flush assistant text to logs
   const flushAssistantText = (label = persona.name) => {
     const text = currentAssistantText.trim();
     if (text) {
@@ -106,8 +112,6 @@ wss.on("connection", async (twilioWS, req) => {
       currentAssistantText = "";
     }
   };
-
-  // Helper: flush user text to logs
   const flushUserText = () => {
     const text = currentUserText.trim();
     if (text) {
@@ -116,7 +120,7 @@ wss.on("connection", async (twilioWS, req) => {
     }
   };
 
-  // ---- Twilio -> OpenAI audio handling ----
+  // Twilio -> OpenAI
   twilioWS.on("message", (msg) => {
     try {
       const data = JSON.parse(msg.toString());
@@ -129,22 +133,18 @@ wss.on("connection", async (twilioWS, req) => {
         });
       } else if (data.event === "media" && data.media?.payload) {
         if (!oaiConnected) {
-          console.log("⚠️ append failed: OpenAI WS not ready yet");
+          // Avoid noisy “readyState 0 (CONNECTING)” logs
           return;
         }
-        // Forward G.711 ulaw audio frames (base64) directly
         oaiWS.send(
           JSON.stringify({
             type: "input_audio_buffer.append",
             audio: data.media.payload,
           })
         );
-      } else if (data.event === "mark" || data.event === "ping") {
-        // ignore
       } else if (data.event === "stop") {
         console.log("🧵 Twilio event: stop");
         if (oaiConnected) {
-          // Let OAI finalize any pending input
           oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
         }
       }
@@ -157,26 +157,29 @@ wss.on("connection", async (twilioWS, req) => {
     console.log("❌ Twilio WebSocket closed");
     if (oaiWS.readyState === WebSocket.OPEN) oaiWS.close();
   });
-
   twilioWS.on("error", (err) => {
     console.error("❗ Twilio WS error:", err?.message || err);
   });
 
-  // ---- OpenAI Realtime events ----
+  // OpenAI -> Twilio
   oaiWS.on("open", () => {
     oaiConnected = true;
     console.log("🔗 OpenAI Realtime connected");
+    console.log("👤 persona snapshot:", {
+      name: persona.name,
+      language: persona.language,
+      voice: persona.voice,
+      scope: persona.scope,
+    });
 
-    // session.update — configure formats, VAD, voice, and system instructions
     const sessionUpdate = {
       type: "session.update",
       session: {
-        input_audio_format: "g711_ulaw", // IMPORTANT: string, not object
+        input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
         turn_detection: { type: "server_vad" },
         voice: persona.voice || "shimmer",
         instructions: buildSystemInstructions(persona),
-        // Ensure the model can speak and produce text
         modalities: ["audio", "text"],
       },
     };
@@ -185,11 +188,10 @@ wss.on("connection", async (twilioWS, req) => {
       `✅ session.update sent (ASR=${persona.language}, VAD=server, format=g711_ulaw)`
     );
 
-    // Send initial short greeting from persona
+    // Short greeting
     const initialGreeting =
-      persona.greeting && persona.greeting.trim()
-        ? persona.greeting.trim()
-        : `Hi, this is ${persona.name}. Are we testing right now, or is there a real task?`;
+      persona.greeting?.trim() ||
+      `Hi, this is ${persona.name}. Are we testing right now, or is there a real task?`;
 
     oaiWS.send(
       JSON.stringify({
@@ -211,25 +213,19 @@ wss.on("connection", async (twilioWS, req) => {
       return;
     }
 
-    // Debug low-level errors
     if (evt.type === "error") {
       console.log("🔻 OAI error:", JSON.stringify(evt, null, 2));
     }
 
-    // VAD indicators (useful in logs)
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log("🔎 OAI event: input_audio_buffer.speech_started");
-      // start fresh user buffer
       currentUserText = "";
     }
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
-      // Let the model process; transcript will come via transcription events
     }
 
-    // --- USER transcript (real-time deltas & final) ---
-    // Newer Realtime models emit transcription as:
-    //   response.input_audio_transcription.delta / .completed
+    // User transcript (if model emits it)
     if (evt.type === "response.input_audio_transcription.delta") {
       currentUserText += evt.delta || "";
     }
@@ -237,49 +233,39 @@ wss.on("connection", async (twilioWS, req) => {
       flushUserText();
     }
 
-    // --- ASSISTANT text output (deltas & final) ---
+    // Assistant text stream
     if (evt.type === "response.output_text.delta") {
-      // Accumulate assistant text deltas to log human-readable lines
       currentAssistantText += evt.delta || "";
-      // Optional: live token stream marker (compact)
       const chunk = (evt.delta || "").trim();
-      if (chunk) {
-        // Show compact live chunks in one line with a Δ marker
-        console.log(`🗣️ ${persona.name}Δ ${chunk}`);
-      }
+      if (chunk) console.log(`🗣️ ${persona.name}Δ ${chunk}`);
     }
     if (evt.type === "response.completed") {
-      // Finalize assistant output line
       flushAssistantText(persona.name);
     }
 
-    // --- ASSISTANT audio (forward to Twilio) ---
+    // Assistant audio -> Twilio
     if (evt.type === "response.output_audio.delta" && evt.delta) {
-      // evt.delta is base64 g711_ulaw data
-      // Wrap into Twilio "media" message format
-      const twilioMedia = {
-        event: "media",
-        media: { payload: evt.delta },
-      };
+      const twilioMedia = { event: "media", media: { payload: evt.delta } };
       if (twilioWS.readyState === WebSocket.OPEN) {
         twilioWS.send(JSON.stringify(twilioMedia));
       }
     }
-
-    // When the model wants to speak or proceed, it may emit tool/response states; no extra action needed here
   });
 
   oaiWS.on("close", () => {
     console.log("❌ OpenAI Realtime closed");
     if (twilioWS.readyState === WebSocket.OPEN) twilioWS.close();
   });
-
   oaiWS.on("error", (err) => {
     console.error("❗ OpenAI WS error:", err?.message || err);
   });
 });
 
-// ---- Start server ----
-server.listen(PORT, () => {
+// Process-level safety logs
+process.on("uncaughtException", (e) => console.error("💥 uncaughtException:", e));
+process.on("unhandledRejection", (e) => console.error("💥 unhandledRejection:", e));
+
+// Start
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server listening on port ${PORT}`);
 });
