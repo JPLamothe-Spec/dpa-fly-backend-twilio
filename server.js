@@ -1,9 +1,9 @@
-// server.js (CommonJS) — Twilio <-> OpenAI Realtime with server VAD, ulaw, and persona alignment
+// server.js — Twilio <-> OpenAI Realtime with server VAD, μ-law, transcripts, and "never call user Anna"
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const WebSocket = require("ws");
-const persona = require("./persona"); // <- uses your persona.js
+const persona = require("./persona"); // uses your persona.js
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -45,7 +45,7 @@ app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) =>
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/call" });
 
-// Twilio PCMU: 20ms at 8kHz -> 160 bytes
+// Twilio PCMU: 20ms @ 8kHz = 160 bytes
 const TWILIO_FRAME_BYTES = 160;
 
 // chunk helper
@@ -62,34 +62,31 @@ wss.on("connection", (twilioWS, req) => {
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
-  let oaiReady = false;
   let streamSid = null;
-
-  // prevent overlapping response.create
-  let responseActive = false;
+  let oaiReady = false;
   let greeted = false;
+  let responseActive = false;
 
-  // live transcript buffers
+  // Buffers for Twilio -> OAI
+  let inboundBuf = Buffer.alloc(0);
+  let inboundFrames = 0;
+  let framesSinceCommit = 0;
+
+  // Logs for transcripts
   let userPartial = "";
   let asstPartial = "";
 
-  // batch input audio for server VAD (append only)
-  let inboundBuf = Buffer.alloc(0);
-  let inboundFrames = 0;
-
   const flushInbound = () => {
     if (!inboundFrames) return;
-    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) {
-      // keep buffer until OpenAI socket is open
-      return;
-    }
+    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return;
     const b64 = inboundBuf.toString("base64");
     try {
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       console.log(`🔊 appended ${inboundFrames} frame(s) ≈${inboundFrames * 20}ms (${inboundBuf.length} bytes)`);
-      inboundBuf = Buffer.alloc(0);
-      inboundFrames = 0;
+      framesSinceCommit += inboundFrames;
     } catch {}
+    inboundBuf = Buffer.alloc(0);
+    inboundFrames = 0;
   };
 
   const queueInbound = (chunk) => {
@@ -98,17 +95,19 @@ wss.on("connection", (twilioWS, req) => {
     if (inboundFrames >= 10) flushInbound(); // ~200ms
   };
 
-  const sendGreetingOnce = () => {
-    if (greeted || responseActive || !oaiReady) return;
+  const safeGreetingOnce = () => {
+    if (!oaiReady || greeted || responseActive) return;
     greeted = true;
     responseActive = true;
     console.log("📣 greeting response.create sent");
+    // Extra guard in the greeting text to prevent addressing caller by name.
+    const greetingText = `${persona.greeting}\nRemember: never address the caller by any name. Address them only as "you".`;
     oaiWS.send(JSON.stringify({
       type: "response.create",
       response: {
         modalities: ["audio", "text"],
         conversation: "auto",
-        instructions: persona.greeting,         // <- short dev greeting
+        instructions: greetingText,
         output_audio_format: "g711_ulaw",
       },
     }));
@@ -127,6 +126,8 @@ wss.on("connection", (twilioWS, req) => {
           voice: persona.voice,
           dev: false,
         });
+        // we might already be open to OAI; if so, greet now
+        safeGreetingOnce();
         break;
       }
       case "media": {
@@ -161,31 +162,30 @@ wss.on("connection", (twilioWS, req) => {
       scope: persona.scope,
     });
 
-    // Session config aligned with persona
+    // Session config — strictly English, server VAD, μ-law
     oaiWS.send(JSON.stringify({
       type: "session.update",
       session: {
-        // Server VAD
         turn_detection: { type: "server_vad", prefix_padding_ms: 300, silence_duration_ms: 200 },
-        // Formats MUST be strings
         input_audio_format: "g711_ulaw",
         output_audio_format: "g711_ulaw",
-        // English-only ASR
         input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: persona.language },
-        // Voice + behavior
         voice: persona.voice,
         language: persona.language,
-        instructions: persona.instructions,     // <- full behavior contract (incl. “don’t call user Anna”)
+        // Hard rule to NEVER name the caller
+        instructions:
+          persona.instructions +
+          "\n\nHARD RULE: Never address the caller by any name. 'Anna' is your own name; never say 'Hi Anna' to the caller.",
         modalities: ["audio", "text"],
       },
     }));
     console.log("✅ session.update sent (ASR=en, VAD=server, format=g711_ulaw)");
 
-    // Flush any audio buffered before OAI was ready
+    // push any buffered audio that arrived before OAI was ready
     flushInbound();
 
-    // Single, short greeting
-    sendGreetingOnce();
+    // if Twilio already started, send greeting now
+    safeGreetingOnce();
   });
 
   oaiWS.on("message", (data) => {
@@ -196,14 +196,25 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // VAD events (for visibility)
+    // VAD visibility
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log("🔎 OAI event: input_audio_buffer.speech_started");
       return;
     }
+
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
       flushInbound();
+
+      // Only commit if we actually appended audio since last commit
+      if (framesSinceCommit > 0 && oaiWS.readyState === WebSocket.OPEN) {
+        try {
+          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        } catch {}
+      } else {
+        console.log("ℹ️ Skip commit: no new audio since last commit");
+      }
+
       if (!responseActive) {
         responseActive = true;
         console.log("📣 response.create sent after speech_stopped");
@@ -216,10 +227,12 @@ wss.on("connection", (twilioWS, req) => {
           },
         }));
       }
+      // reset counter after committing for this turn
+      framesSinceCommit = 0;
       return;
     }
 
-    // --- USER transcript events (handle multiple possible shapes) ---
+    // USER transcript (handle various shapes)
     if (evt.type === "response.input_audio_transcription.delta" && evt.delta) {
       userPartial += evt.delta;
       process.stdout.write(`📝 ${evt.delta}`);
@@ -236,23 +249,19 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // --- ASSISTANT text (what Anna says) ---
+    // ASSISTANT text (what Anna says)
     if (evt.type === "response.output_text.delta" && evt.delta) {
       asstPartial += evt.delta;
       process.stdout.write(`🗣️ ${persona.name}Δ ${evt.delta}`);
       return;
     }
-    if (
-      (evt.type === "response.output_text.completed" && evt.text) ||
-      (evt.type === "response.completed" && evt.output_text)
-    ) {
-      const text = evt.text || evt.output_text || "";
-      console.log(`\n🗣️ ${persona.name}: ${text.trim()}`);
+    if (evt.type === "response.output_text.completed" && evt.text) {
+      console.log(`\n🗣️ ${persona.name}: ${evt.text.trim()}`);
       asstPartial = "";
       return;
     }
 
-    // --- ASSISTANT audio (µ-law) -> Twilio ---
+    // ASSISTANT audio → Twilio (μ-law frames)
     if (
       evt.type === "response.output_audio.delta" ||
       evt.type === "response.audio.delta" ||
@@ -268,7 +277,7 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // --- Response lifecycle: release the gate when done ---
+    // Response lifecycle (release the "active" gate)
     if (
       evt.type === "response.completed" ||
       evt.type === "response.output_audio.done" ||
