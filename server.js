@@ -1,8 +1,9 @@
-// server.js (CommonJS) — Twilio <-> OpenAI Realtime bridge with server VAD + English-only
+// server.js (CommonJS) — Twilio <-> OpenAI Realtime with server VAD, ulaw, and persona alignment
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
 const WebSocket = require("ws");
+const persona = require("./persona"); // <- uses your persona.js
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -23,7 +24,7 @@ app.get("/healthz", (_, res) => res.status(200).send("ok"));
 // Twilio webhook -> start Media Stream
 app.post("/twilio/voice", express.urlencoded({ extended: false }), (req, res) => {
   const xfProto = (req.get("x-forwarded-proto") || "").split(",")[0].trim();
-  const scheme = xfProto === "http" ? "ws" : "wss"; // default to wss
+  const scheme = xfProto === "http" ? "ws" : "wss"; // prefer wss
   const wsUrl = `${scheme}://${req.get("host")}/call`;
 
   const twiml = [
@@ -61,20 +62,56 @@ wss.on("connection", (twilioWS, req) => {
     { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "OpenAI-Beta": "realtime=v1" } }
   );
 
+  let oaiReady = false;
   let streamSid = null;
 
-  // batch input audio for server VAD (append only, no commit)
+  // prevent overlapping response.create
+  let responseActive = false;
+  let greeted = false;
+
+  // live transcript buffers
+  let userPartial = "";
+  let asstPartial = "";
+
+  // batch input audio for server VAD (append only)
   let inboundBuf = Buffer.alloc(0);
   let inboundFrames = 0;
+
   const flushInbound = () => {
     if (!inboundFrames) return;
+    if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) {
+      // keep buffer until OpenAI socket is open
+      return;
+    }
     const b64 = inboundBuf.toString("base64");
     try {
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
       console.log(`🔊 appended ${inboundFrames} frame(s) ≈${inboundFrames * 20}ms (${inboundBuf.length} bytes)`);
+      inboundBuf = Buffer.alloc(0);
+      inboundFrames = 0;
     } catch {}
-    inboundBuf = Buffer.alloc(0);
-    inboundFrames = 0;
+  };
+
+  const queueInbound = (chunk) => {
+    inboundBuf = Buffer.concat([inboundBuf, chunk]);
+    inboundFrames += Math.floor(chunk.length / TWILIO_FRAME_BYTES);
+    if (inboundFrames >= 10) flushInbound(); // ~200ms
+  };
+
+  const sendGreetingOnce = () => {
+    if (greeted || responseActive || !oaiReady) return;
+    greeted = true;
+    responseActive = true;
+    console.log("📣 greeting response.create sent");
+    oaiWS.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        conversation: "auto",
+        instructions: persona.greeting,         // <- short dev greeting
+        output_audio_format: "g711_ulaw",
+      },
+    }));
   };
 
   // ---- Twilio handlers ----
@@ -84,7 +121,12 @@ wss.on("connection", (twilioWS, req) => {
     switch (msg.event) {
       case "start": {
         streamSid = msg.start?.streamSid;
-        console.log("🎬 Twilio stream START:", { streamSid, model: OAI_MODEL, voice: "shimmer", dev: false });
+        console.log("🎬 Twilio stream START:", {
+          streamSid,
+          model: OAI_MODEL,
+          voice: persona.voice,
+          dev: false,
+        });
         break;
       }
       case "media": {
@@ -92,9 +134,7 @@ wss.on("connection", (twilioWS, req) => {
         if (!payloadB64) return;
         const chunk = Buffer.from(payloadB64, "base64");
         if (!chunk.length) return;
-        inboundBuf = Buffer.concat([inboundBuf, chunk]);
-        inboundFrames += Math.floor(chunk.length / TWILIO_FRAME_BYTES);
-        if (inboundFrames >= 10) flushInbound(); // ~200ms
+        queueInbound(chunk);
         break;
       }
       case "stop": {
@@ -112,45 +152,110 @@ wss.on("connection", (twilioWS, req) => {
 
   // ---- OpenAI handlers ----
   oaiWS.on("open", () => {
+    oaiReady = true;
     console.log("🔗 OpenAI Realtime connected");
+    console.log("👤 persona snapshot:", {
+      name: persona.name,
+      language: persona.language,
+      voice: persona.voice,
+      scope: persona.scope,
+    });
 
-    // IMPORTANT: formats must be strings, not objects
+    // Session config aligned with persona
     oaiWS.send(JSON.stringify({
       type: "session.update",
       session: {
+        // Server VAD
         turn_detection: { type: "server_vad", prefix_padding_ms: 300, silence_duration_ms: 200 },
-        input_audio_format: "g711_ulaw",   // <- string
-        output_audio_format: "g711_ulaw",  // <- string
-        input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: "en" },
-        instructions: "You are DPA. Speak only English. Be brief and helpful on phone calls.",
+        // Formats MUST be strings
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        // English-only ASR
+        input_audio_transcription: { model: "gpt-4o-mini-transcribe", language: persona.language },
+        // Voice + behavior
+        voice: persona.voice,
+        language: persona.language,
+        instructions: persona.instructions,     // <- full behavior contract (incl. “don’t call user Anna”)
+        modalities: ["audio", "text"],
       },
     }));
-
-    // conversation must be "auto" or "none"
-    oaiWS.send(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        conversation: "auto", // <- string, not object
-        instructions: "Hello! This is DPA. How can I help you today?",
-      },
-    }));
-
     console.log("✅ session.update sent (ASR=en, VAD=server, format=g711_ulaw)");
+
+    // Flush any audio buffered before OAI was ready
+    flushInbound();
+
+    // Single, short greeting
+    sendGreetingOnce();
   });
 
   oaiWS.on("message", (data) => {
     let evt; try { evt = JSON.parse(data.toString()); } catch { return; }
 
-    if (evt.type?.startsWith("error")) {
+    if (evt.type?.startsWith("error") || evt.type === "error") {
       console.log("🔻 OAI error:", JSON.stringify(evt, null, 2));
       return;
     }
 
-    // Forward audio deltas to Twilio
+    // VAD events (for visibility)
+    if (evt.type === "input_audio_buffer.speech_started") {
+      console.log("🔎 OAI event: input_audio_buffer.speech_started");
+      return;
+    }
+    if (evt.type === "input_audio_buffer.speech_stopped") {
+      console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
+      flushInbound();
+      if (!responseActive) {
+        responseActive = true;
+        console.log("📣 response.create sent after speech_stopped");
+        oaiWS.send(JSON.stringify({
+          type: "response.create",
+          response: {
+            modalities: ["audio", "text"],
+            conversation: "auto",
+            output_audio_format: "g711_ulaw",
+          },
+        }));
+      }
+      return;
+    }
+
+    // --- USER transcript events (handle multiple possible shapes) ---
+    if (evt.type === "response.input_audio_transcription.delta" && evt.delta) {
+      userPartial += evt.delta;
+      process.stdout.write(`📝 ${evt.delta}`);
+      return;
+    }
     if (
-      evt.type === "response.audio.delta" ||
+      (evt.type === "response.input_audio_transcription.completed" && evt.transcript) ||
+      (evt.type === "input_audio_transcription.completed" && evt.transcript) ||
+      (evt.type === "response.audio_transcript.done" && evt.transcript) ||
+      (evt.type === "response.transcript.completed" && evt.transcript)
+    ) {
+      console.log(`\n📝 transcript (user): ${evt.transcript.trim()}`);
+      userPartial = "";
+      return;
+    }
+
+    // --- ASSISTANT text (what Anna says) ---
+    if (evt.type === "response.output_text.delta" && evt.delta) {
+      asstPartial += evt.delta;
+      process.stdout.write(`🗣️ ${persona.name}Δ ${evt.delta}`);
+      return;
+    }
+    if (
+      (evt.type === "response.output_text.completed" && evt.text) ||
+      (evt.type === "response.completed" && evt.output_text)
+    ) {
+      const text = evt.text || evt.output_text || "";
+      console.log(`\n🗣️ ${persona.name}: ${text.trim()}`);
+      asstPartial = "";
+      return;
+    }
+
+    // --- ASSISTANT audio (µ-law) -> Twilio ---
+    if (
       evt.type === "response.output_audio.delta" ||
+      evt.type === "response.audio.delta" ||
       evt.type === "output_audio.delta"
     ) {
       const b64 = evt.delta || evt.audio;
@@ -163,16 +268,13 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // Optional transcript logs
-    if (evt.type === "response.audio_transcript.delta" || evt.type === "response.audio_transcript.done") {
-      if (evt.type.endsWith(".delta") && evt.delta) process.stdout.write(`📝 ${evt.delta}`);
-      else if (evt.transcript) console.log(`\n📝 transcript: ${evt.transcript}`);
-      else console.log(`\n🔎 OAI event: ${evt.type}`);
-      return;
-    }
-
-    if (evt.type === "input_audio_buffer.speech_started" || evt.type === "input_audio_buffer.speech_stopped") {
-      console.log(`🔎 OAI event: ${evt.type}`);
+    // --- Response lifecycle: release the gate when done ---
+    if (
+      evt.type === "response.completed" ||
+      evt.type === "response.output_audio.done" ||
+      evt.type === "response.finalize"
+    ) {
+      responseActive = false;
       return;
     }
   });
