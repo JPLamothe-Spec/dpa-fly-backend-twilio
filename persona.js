@@ -24,7 +24,7 @@ Core rules:
 Tone: clear, concise, friendly, professional. No marketing spiels. No capability lists. No language switching.
 `.trim();
 
-const GREETING = `Hi, this is ${NAME} on the dev line. Are we testing right now?`;
+const GREETING = `Hi, this is Anna on the dev line. Are we testing right now?`;
 
 module.exports = {
   name: NAME,
