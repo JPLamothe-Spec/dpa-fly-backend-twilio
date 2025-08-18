@@ -1,4 +1,4 @@
-// server.js — Twilio <-> OpenAI Realtime with server VAD, μ-law, correct transcript labels, and safe commit gating
+// server.js — Twilio <-> OpenAI Realtime with server VAD, μ-law, robust commit gating, and wide transcript logging
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
@@ -69,14 +69,19 @@ wss.on("connection", (twilioWS, req) => {
   let inboundFrames = 0;
   let appendedSinceLastCommit = false;
 
+  // NEW: track frames within the current speech turn to avoid commit_empty
+  let speechFramesThisTurn = 0;
+
   const flushInbound = () => {
     if (!inboundFrames) return;
     if (!oaiReady || oaiWS.readyState !== WebSocket.OPEN) return;
+    const frames = inboundFrames; // capture before reset
     const b64 = inboundBuf.toString("base64");
     try {
       oaiWS.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
-      console.log(`🔊 appended ${inboundFrames} frame(s) ≈${inboundFrames * 20}ms (${inboundBuf.length} bytes)`);
+      console.log(`🔊 appended ${frames} frame(s) ≈${frames * 20}ms (${inboundBuf.length} bytes)`);
       appendedSinceLastCommit = true;
+      speechFramesThisTurn += frames; // count toward this VAD turn
     } catch {}
     inboundBuf = Buffer.alloc(0);
     inboundFrames = 0;
@@ -153,7 +158,6 @@ wss.on("connection", (twilioWS, req) => {
       scope: persona.scope,
     });
 
-    // Valid session fields only
     oaiWS.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -181,21 +185,23 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // —— VAD events
+    // —— VAD events (server-side detection on OAI)
     if (evt.type === "input_audio_buffer.speech_started") {
       console.log("🔎 OAI event: input_audio_buffer.speech_started");
+      // NEW: start a new turn counter
+      speechFramesThisTurn = 0;
       return;
     }
 
     if (evt.type === "input_audio_buffer.speech_stopped") {
       console.log("🔎 OAI event: input_audio_buffer.speech_stopped");
-      flushInbound(); // final flush before commit
-      if (appendedSinceLastCommit && oaiWS.readyState === WebSocket.OPEN) {
-        try {
-          oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        } catch {}
+      // final flush for this turn before commit
+      flushInbound();
+      if (speechFramesThisTurn > 0 && appendedSinceLastCommit && oaiWS.readyState === WebSocket.OPEN) {
+        try { oaiWS.send(JSON.stringify({ type: "input_audio_buffer.commit" })); }
+        catch {}
       } else {
-        console.log("ℹ️ Skip commit: no new audio since last commit");
+        console.log("ℹ️ Skip commit: no audio appended this turn");
       }
       if (!responseActive) {
         responseActive = true;
@@ -209,21 +215,29 @@ wss.on("connection", (twilioWS, req) => {
           },
         }));
       }
-      // reset for next turn
+      // reset commit gate (for next turn)
       appendedSinceLastCommit = false;
       return;
     }
 
-    // —— USER transcript (use ONLY input_audio_transcription.*)
-    if (evt.type === "response.input_audio_transcription.delta" && evt.delta) {
-      process.stdout.write(`👤 userΔ ${evt.delta}`);
-      return;
-    }
+    // —— USER transcript: handle every plausible event name, log clearly
     if (
-      evt.type === "response.input_audio_transcription.completed" ||
-      evt.type === "input_audio_transcription.completed"
+      evt.type?.includes("input_audio_transcription") ||
+      evt.type === "response.input_text.delta" ||
+      evt.type === "response.input_text.completed" ||
+      evt.type === "input_audio_transcription.completed" ||
+      evt.type === "response.input_audio_text.delta" ||
+      evt.type === "response.input_audio_text.completed"
     ) {
+      // delta-like payloads
+      if (evt.delta) process.stdout.write(`👤 userΔ ${evt.delta}`);
+      // completed-like payloads
       if (evt.transcript) console.log(`\n📝 user: ${evt.transcript.trim()}`);
+      if (evt.text) console.log(`\n📝 user: ${evt.text.trim()}`);
+      // If the schema changes, dump once for visibility
+      if (!evt.delta && !evt.transcript && !evt.text) {
+        console.log("🧩 user-transcript evt:", JSON.stringify(evt));
+      }
       return;
     }
 
@@ -237,7 +251,7 @@ wss.on("connection", (twilioWS, req) => {
       return;
     }
 
-    // —— ASSISTANT speech transcript (correctly labeled)
+    // —— ASSISTANT speech transcript
     if (evt.type === "response.audio_transcript.delta" && evt.delta) {
       process.stdout.write(`🎧 asstΔ ${evt.delta}`);
       return;
@@ -271,6 +285,14 @@ wss.on("connection", (twilioWS, req) => {
     ) {
       responseActive = false;
       return;
+    }
+
+    // LAST RESORT: surface unexpected events while we iterate
+    if (
+      evt.type?.includes("transcript") ||
+      evt.type?.includes("transcription")
+    ) {
+      console.log("🧩 transcript-ish evt:", JSON.stringify(evt));
     }
   });
 
