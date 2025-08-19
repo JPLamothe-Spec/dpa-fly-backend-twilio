@@ -1,85 +1,90 @@
-// server.js  — CommonJS version (Node 18+/20+)
+// server.js — CommonJS, Fly.io + Twilio Realtime bridge
+'use strict';
+
 const fs = require('node:fs');
 const path = require('node:path');
-const express = require('express');
 const http = require('http');
+const express = require('express');
 const bodyParser = require('body-parser');
 const WebSocket = require('ws');
-
 const { WebSocketServer } = WebSocket;
 
-// ---------- config ----------
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000; // Fly often expects 3000
+// ---- config ----
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000; // Fly default
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
-const VOICE = process.env.REALTIME_VOICE || 'shimmer';
-const DEV_SCOPE = process.env.DPA_SCOPE || 'dev_test_personal_assistant';
+const DEFAULT_VOICE = process.env.REALTIME_VOICE || 'shimmer';
+const DEFAULT_SCOPE = process.env.DPA_SCOPE || 'dev_test_personal_assistant';
+const PUBLIC_HOST = process.env.PUBLIC_HOST || ''; // e.g. "dpa-fly-backend-twilio.fly.dev"
 
-// ---------- tiny logger ----------
-const log = (...args) => console.log(new Date().toISOString(), ...args);
+// ---- tiny logger ----
+const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-// ---------- persona loader ----------
+// ---- persona loader ----
 function loadPersona() {
-  // default persona path: ./persona/anna.json
-  const p = path.resolve(process.cwd(), 'persona', 'anna.json');
+  const file = path.resolve(process.cwd(), 'persona', 'anna.json');
   try {
-    const raw = fs.readFileSync(p, 'utf8');
-    const persona = JSON.parse(raw);
+    const raw = fs.readFileSync(file, 'utf8');
+    const p = JSON.parse(raw);
     return {
-      name: persona.name || 'Anna',
-      language: persona.language || 'en',
-      voice: persona.voice || VOICE,
-      scope: persona.scope || DEV_SCOPE,
-      system: persona.system || '',
+      name: p.name || 'Anna',
+      language: p.language || 'en',
+      voice: p.voice || DEFAULT_VOICE,
+      scope: p.scope || DEFAULT_SCOPE,
+      system: p.system || '',
     };
-  } catch (e) {
-    log('⚠️  Persona load failed, using defaults:', e.message);
-    return { name: 'Anna', language: 'en', voice: VOICE, scope: DEV_SCOPE, system: '' };
+  } catch (err) {
+    log('⚠️ Persona load failed, using defaults:', err.message);
+    return { name: 'Anna', language: 'en', voice: DEFAULT_VOICE, scope: DEFAULT_SCOPE, system: '' };
   }
 }
 
-// ---------- app & routes ----------
+// ---- express ----
 const app = express();
+app.set('trust proxy', true);
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Health + root so Fly smoke checks succeed
 app.get('/', (_req, res) => res.status(200).send('ok'));
 app.get('/healthz', (_req, res) => res.status(200).json({ ok: true }));
 
-// Twilio hits this to begin the websocket media stream
+// Twilio entry point – returns TwiML with a **WSS** stream URL
 app.post('/twilio/voice', (req, res) => {
-  const streamUrl = `${req.protocol}://${req.get('host')}/call`;
-  const twiml = [
-    '<?xml version="1.0" encoding="UTF-8"?>',
-    '<Response>',
-    `  <Connect><Stream url="${streamUrl}" track="inbound_track"/></Connect>`,
-    '  <Pause length="600"/>',
-    '</Response>',
-  ].join('');
+  const host =
+    PUBLIC_HOST ||
+    req.get('x-forwarded-host') ||
+    req.get('host');
+
+  const streamUrl = `wss://${host}/call`; // <— force WSS
+  const twiml =
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+    `<Connect><Stream url="${streamUrl}" track="inbound_track"/></Connect>` +
+    `<Pause length="600"/>` +
+    `</Response>`;
+
   log('➡️ /twilio/voice hit (POST)');
   log('🧾 TwiML returned:\n' + twiml);
   res.type('text/xml').send(twiml);
 });
 
-// ---------- HTTP server + WS endpoint for Twilio ----------
+// ---- HTTP + WS endpoint ----
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   if (req.url === '/call') {
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req));
   } else {
     socket.destroy();
   }
 });
 
-// ---------- Twilio <-> OpenAI Realtime bridge ----------
+// ---- Twilio <-> OpenAI bridge ----
 wss.on('connection', async (twilioWs, req) => {
   const persona = loadPersona();
   log('✅ Twilio WebSocket connected from', req.socket.remoteAddress);
 
-  // Connect to OpenAI Realtime WebSocket
   const oaiWs = new WebSocket(
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(MODEL)}`,
     {
@@ -90,34 +95,24 @@ wss.on('connection', async (twilioWs, req) => {
     }
   );
 
+  let streamSid;
   let framesSinceLastCommit = 0; // avoid commit_empty
   let asstPartial = '';
-  let streamSid;
 
-  const sendToTwilio = (payloadBase64) => {
-    if (twilioWs.readyState === WebSocket.OPEN) {
-      twilioWs.send(
-        JSON.stringify({
-          event: 'media',
-          streamSid,
-          media: { payload: payloadBase64 },
-        })
-      );
-    }
-  };
-
-  const oaiSend = (obj) => {
+  const oaiSend = obj => {
     if (oaiWs.readyState === WebSocket.OPEN) oaiWs.send(JSON.stringify(obj));
   };
 
-  // ---- Twilio incoming -> OpenAI ----
-  twilioWs.on('message', (data) => {
-    let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
+  const sendToTwilio = base64Ulaw => {
+    if (twilioWs.readyState === WebSocket.OPEN) {
+      twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: base64Ulaw } }));
     }
+  };
+
+  // ---- Twilio -> OpenAI ----
+  twilioWs.on('message', data => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     switch (msg.event) {
       case 'start': {
@@ -129,7 +124,6 @@ wss.on('connection', async (twilioWs, req) => {
           dev: false,
         });
 
-        // Configure Realtime session for 8k G.711 μ-law both directions
         oaiSend({
           type: 'session.update',
           session: {
@@ -137,25 +131,21 @@ wss.on('connection', async (twilioWs, req) => {
             output_audio_format: { type: 'g711_ulaw', sample_rate_hz: 8000 },
             turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 200 },
             input_transcription: { model: 'whisper-1', language: persona.language },
-            instructions: [
-              `You are ${persona.name}, a helpful, concise personal assistant.`,
-              persona.system || '',
-            ]
-              .filter(Boolean)
-              .join('\n'),
             voice: persona.voice,
+            instructions: [
+              `You are ${persona.name}, a concise, friendly personal assistant.`,
+              persona.system || '',
+            ].filter(Boolean).join('\n'),
           },
         });
         log('✅ session.update sent (ASR=en, VAD=server, format=g711_ulaw)');
 
-        // Greeting
         oaiSend({
           type: 'response.create',
           response: {
             modalities: ['audio', 'text'],
             conversation: 'none',
-            instructions:
-              'Greet the caller briefly and ask how you can help. If testing, acknowledge test mode.',
+            instructions: 'Greet briefly and ask how you can help.',
           },
         });
         log('📣 greeting response.create sent');
@@ -164,46 +154,34 @@ wss.on('connection', async (twilioWs, req) => {
 
       case 'media': {
         framesSinceLastCommit++;
-        oaiSend({
-          type: 'input_audio_buffer.append',
-          audio: msg.media.payload, // base64 ulaw passthrough
-        });
+        oaiSend({ type: 'input_audio_buffer.append', audio: msg.media.payload });
         break;
       }
 
       case 'stop': {
         log('🧵 Twilio event: stop');
-        try {
-          twilioWs.close();
-        } catch {}
+        try { twilioWs.close(); } catch {}
         break;
       }
-      default:
-        break;
     }
   });
 
   twilioWs.on('close', () => {
-    try {
-      oaiWs.close();
-    } catch {}
+    try { oaiWs.close(); } catch {}
     log('❌ Twilio WebSocket closed');
   });
 
-  twilioWs.on('error', (e) => log('❌ Twilio WS error:', e?.message));
+  twilioWs.on('error', e => log('❌ Twilio WS error:', e?.message));
 
-  // ---- OpenAI -> events / audio back to Twilio ----
+  // ---- OpenAI -> Twilio ----
   oaiWs.on('open', () => {
     log('🔗 OpenAI Realtime connected');
     log('👤 persona snapshot:', {
-      name: persona.name,
-      language: persona.language,
-      voice: persona.voice,
-      scope: persona.scope,
+      name: persona.name, language: persona.language, voice: persona.voice, scope: persona.scope,
     });
   });
 
-  oaiWs.on('message', (raw) => {
+  oaiWs.on('message', raw => {
     const evt = JSON.parse(raw.toString());
 
     if (evt.type === 'input_audio_buffer.speech_started') {
@@ -213,9 +191,7 @@ wss.on('connection', async (twilioWs, req) => {
 
     if (evt.type === 'input_audio_buffer.speech_stopped') {
       log('🔎 OAI event: input_audio_buffer.speech_stopped');
-      if (framesSinceLastCommit > 0) {
-        oaiSend({ type: 'input_audio_buffer.commit' });
-      }
+      if (framesSinceLastCommit > 0) oaiSend({ type: 'input_audio_buffer.commit' });
       framesSinceLastCommit = 0;
       oaiSend({ type: 'input_transcription.create' });
     }
@@ -239,7 +215,7 @@ wss.on('connection', async (twilioWs, req) => {
     }
 
     if (evt.type === 'response.audio.delta') {
-      sendToTwilio(evt.delta); // base64 g711_ulaw
+      sendToTwilio(evt.delta); // base64 g711 μ-law back to Twilio
     }
 
     if (evt.type === 'error') {
@@ -249,18 +225,14 @@ wss.on('connection', async (twilioWs, req) => {
 
   oaiWs.on('close', () => {
     log('❌ OpenAI Realtime closed');
-    try {
-      twilioWs.close();
-    } catch {}
+    try { twilioWs.close(); } catch {}
   });
 
-  oaiWs.on('error', (e) => log('❌ OpenAI WS error:', e?.message));
+  oaiWs.on('error', e => log('❌ OpenAI WS error:', e?.message));
 });
 
-// ---------- start ----------
+// ---- start ----
 server.listen(PORT, () => {
   log(`🚀 server listening on :${PORT}`);
-  if (!OPENAI_API_KEY) {
-    log('❗ OPENAI_API_KEY is not set — the Realtime connection will fail.');
-  }
+  if (!OPENAI_API_KEY) log('❗ OPENAI_API_KEY is not set — Realtime connection will fail.');
 });
