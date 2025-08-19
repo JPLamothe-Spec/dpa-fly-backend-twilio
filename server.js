@@ -1,14 +1,15 @@
-// server.js
-// Node 20+, ESM (package.json: { "type": "module" })
-import fs from 'node:fs';
-import path from 'node:path';
-import express from 'express';
-import http from 'http';
-import bodyParser from 'body-parser';
-import WebSocket, { WebSocketServer } from 'ws';
+// server.js  — CommonJS version (Node 18+/20+)
+const fs = require('node:fs');
+const path = require('node:path');
+const express = require('express');
+const http = require('http');
+const bodyParser = require('body-parser');
+const WebSocket = require('ws');
+
+const { WebSocketServer } = WebSocket;
 
 // ---------- config ----------
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000; // Fly often expects 3000
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL = process.env.REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
 const VOICE = process.env.REALTIME_VOICE || 'shimmer';
@@ -19,8 +20,7 @@ const log = (...args) => console.log(new Date().toISOString(), ...args);
 
 // ---------- persona loader ----------
 function loadPersona() {
-  // Default to ./persona/anna.json (shape: {name, language, voice, system?})
-  // You can swap this to import a JS file if you prefer.
+  // default persona path: ./persona/anna.json
   const p = path.resolve(process.cwd(), 'persona', 'anna.json');
   try {
     const raw = fs.readFileSync(p, 'utf8');
@@ -54,7 +54,7 @@ app.post('/twilio/voice', (req, res) => {
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<Response>',
     `  <Connect><Stream url="${streamUrl}" track="inbound_track"/></Connect>`,
-    '  <Pause length="600"/>', // keep call open; assistant handles turn-taking
+    '  <Pause length="600"/>',
     '</Response>',
   ].join('');
   log('➡️ /twilio/voice hit (POST)');
@@ -90,10 +90,9 @@ wss.on('connection', async (twilioWs, req) => {
     }
   );
 
-  let framesSinceLastCommit = 0; // to avoid commit_empty
-  let userPartial = '';
+  let framesSinceLastCommit = 0; // avoid commit_empty
   let asstPartial = '';
-  let streamSid = undefined;
+  let streamSid;
 
   const sendToTwilio = (payloadBase64) => {
     if (twilioWs.readyState === WebSocket.OPEN) {
@@ -130,7 +129,7 @@ wss.on('connection', async (twilioWs, req) => {
           dev: false,
         });
 
-        // configure Realtime session: input & output are G.711 μ-law @8k for Twilio
+        // Configure Realtime session for 8k G.711 μ-law both directions
         oaiSend({
           type: 'session.update',
           session: {
@@ -149,7 +148,7 @@ wss.on('connection', async (twilioWs, req) => {
         });
         log('✅ session.update sent (ASR=en, VAD=server, format=g711_ulaw)');
 
-        // kick off greeting
+        // Greeting
         oaiSend({
           type: 'response.create',
           response: {
@@ -164,17 +163,13 @@ wss.on('connection', async (twilioWs, req) => {
       }
 
       case 'media': {
-        // Twilio audio (8k ulaw) -> OAI input buffer
         framesSinceLastCommit++;
         oaiSend({
           type: 'input_audio_buffer.append',
-          audio: msg.media.payload, // pass-through base64 ulaw
+          audio: msg.media.payload, // base64 ulaw passthrough
         });
         break;
       }
-
-      case 'mark':
-        break;
 
       case 'stop': {
         log('🧵 Twilio event: stop');
@@ -183,6 +178,8 @@ wss.on('connection', async (twilioWs, req) => {
         } catch {}
         break;
       }
+      default:
+        break;
     }
   });
 
@@ -209,60 +206,42 @@ wss.on('connection', async (twilioWs, req) => {
   oaiWs.on('message', (raw) => {
     const evt = JSON.parse(raw.toString());
 
-    // Helpful debug: log certain engine-side events
     if (evt.type === 'input_audio_buffer.speech_started') {
       log('🔎 OAI event: input_audio_buffer.speech_started');
-      userPartial = '';
       framesSinceLastCommit = 0;
     }
 
     if (evt.type === 'input_audio_buffer.speech_stopped') {
       log('🔎 OAI event: input_audio_buffer.speech_stopped');
-      // Only commit if we actually buffered audio (prevents commit_empty)
       if (framesSinceLastCommit > 0) {
         oaiSend({ type: 'input_audio_buffer.commit' });
       }
       framesSinceLastCommit = 0;
-      // Ask for a transcript of what user just said
       oaiSend({ type: 'input_transcription.create' });
     }
 
-    // User transcript completed
     if (evt.type === 'input_transcription.completed') {
       const text = (evt.transcript || '').trim();
-      if (text) {
-        log('📝 user:', text);
-      }
+      if (text) log('📝 user:', text);
     }
 
-    // Assistant text deltas
     if (evt.type === 'response.output_text.delta') {
-      asstPartial += evt.delta || '';
-      // Print incremental words with the "asstΔ" style seen in your logs
-      const tokens = (evt.delta || '').split(/\s+/).filter(Boolean);
-      if (tokens.length) {
-        log('🎧 asstΔ', tokens.join(' '));
-      }
+      const delta = evt.delta || '';
+      asstPartial += delta;
+      const tokens = delta.split(/\s+/).filter(Boolean);
+      if (tokens.length) log('🎧 asstΔ', tokens.join(' '));
     }
 
-    // Assistant text completed (print the full line once)
     if (evt.type === 'response.output_text.done') {
       const line = (asstPartial || '').trim();
       if (line) log('🎧 asst:', line);
       asstPartial = '';
     }
 
-    // Assistant audio stream (already g711_ulaw base64) -> Twilio
     if (evt.type === 'response.audio.delta') {
-      sendToTwilio(evt.delta);
+      sendToTwilio(evt.delta); // base64 g711_ulaw
     }
 
-    // When the response is fully done, request the next turn (if needed)
-    if (evt.type === 'response.completed') {
-      // noop — VAD will trigger next turn when the user speaks
-    }
-
-    // Bubble up any OpenAI errors cleanly in logs
     if (evt.type === 'error') {
       log('🔻 OAI error:', JSON.stringify(evt, null, 2));
     }
